@@ -1,0 +1,40 @@
+[package]
+name = "server-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-files = "0.6.6"
+actix-web = "4.9.0"
+env_logger = "0.11.6"
+log = "0.4.25"
+notify = "8.0.0"
+scc = "2.3.0"
+serde = { version = "1.0.217", features = ["derive"] }
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3.3.0"
+urlencoding = "2.1.2"
+actix-rt = "2.0"
+tokio = { version = "1.0", features = ["rt", "macros", "test-util"] }
+serde_json = "*"
+
+
+[lints.clippy]
+single_match = "warn"
+single_match_else = "warn"
+needless_match = "warn"
+needless_late_init = "warn"
+redundant_pattern_matching = "warn"
+redundant_pattern = "warn"
+redundant_guards = "warn"
+collapsible_match = "warn"
+match_single_binding = "warn"
+match_same_arms = "warn"
+match_ref_pats = "warn"
+match_bool = "warn"
+needless_bool = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
