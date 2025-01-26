@@ -20,7 +20,7 @@ pub mod metadata {
         name: &str,
     ) -> Result<DirEntMeta, std::io::Error> {
         Ok(DirEntMeta {
-            name: name.to_string(),
+            name: name.to_owned(),
             size: meta.len(),
             modified: meta.modified()?.into(),
             accessed: meta.accessed()?.into(),
@@ -58,16 +58,6 @@ pub mod metadata {
             self.sub_dirs.push(dir);
         }
 
-        // Get all files in this directory (non-recursive)
-        pub fn get_files(&self) -> &[DirEntMeta] {
-            &self.files
-        }
-
-        // Get all subdirectories in this directory (non-recursive)
-        pub fn get_subdirs(&self) -> &[DirEntMeta] {
-            &self.sub_dirs
-        }
-
         pub fn get_all_entries(&self) -> impl Iterator<Item = DirEntMetaFull<'_>> {
             self.sub_dirs
                 .iter()
@@ -83,12 +73,6 @@ pub mod metadata {
 
         pub fn get_file(&self, name: &str) -> Option<&DirEntMeta> {
             self.file_map.get(name).map(|&index| &self.files[index])
-        }
-
-        pub fn get_subdir(&self, name: &str) -> Option<&DirEntMeta> {
-            self.sub_dir_map
-                .get(name)
-                .map(|&index| &self.sub_dirs[index])
         }
     }
 }

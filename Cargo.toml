@@ -3,12 +3,17 @@ name = "server-rs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = [  ]
+logging = ["dep:log", "dep:env_logger"]
+cache_stats = ["logging"]
+
 [dependencies]
 actix-files = "0.6.6"
 actix-web = "4.9.0"
-env_logger = "0.11.6"
-log = "0.4.25"
-notify = "8.0.0"
+env_logger = { version = "0.11.6", optional = true }
+log = { version = "0.4.25", optional = true }
+notify = "8.0.0" 
 scc = "2.3.0"
 serde = { version = "1.0.217", features = ["derive"] }
 thiserror = "2.0.11"
