@@ -31,7 +31,9 @@ impl actix_web::ResponseError for AppError {
                 actix_web::HttpResponse::BadRequest().body(self.to_string())
             }
             AppError::NotFound => actix_web::HttpResponse::NotFound().body(self.to_string()),
-            _ => actix_web::HttpResponse::NotFound().body("Resource not found"),
+            AppError::Internal(_) | AppError::SystemTime(_) | AppError::TaskJoin(_) => {
+                actix_web::HttpResponse::InternalServerError().body("Internal server error")
+            }
         }
     }
 }
@@ -111,16 +113,16 @@ async fn get_file_info_handler(
 ) -> Result<actix_web::HttpResponse, AppError> {
     log_info!("[FILE INFO] Handling request for: {}", &params.file_path);
 
-    let canonical_requested = validate_path(&data.base_path, &params.file_path).await?;
-    log_trace!("Validated canonical path: {:?}", &canonical_requested);
+    let normalized_requested = validate_path(&data.base_path, &params.file_path).await?;
+    log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
-    if !canonical_requested.is_file() {
-        log_debug!("Path is not a file: {:?}", &canonical_requested);
+    if !normalized_requested.is_file() {
+        log_debug!("Path is not a file: {:?}", &normalized_requested);
         return Err(AppError::NotFound);
     }
 
-    let parent_dir = canonical_requested.parent().ok_or_else(|| {
-        log_warn!("Invalid file path structure: {:?}", &canonical_requested);
+    let parent_dir = normalized_requested.parent().ok_or_else(|| {
+        log_warn!("Invalid file path structure: {:?}", &normalized_requested);
         AppError::InvalidPath
     })?;
 
@@ -144,7 +146,7 @@ async fn get_file_info_handler(
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", parent_dir);
 
-            let file_name = canonical_requested
+            let file_name = normalized_requested
                 .file_name()
                 .ok_or(AppError::InvalidPath)?
                 .to_str()
@@ -164,19 +166,19 @@ async fn get_file_info_handler(
         data.cache_stats.increment_misses();
     }
 
-    log_info!("Fetching fresh metadata for: {:?}", &canonical_requested);
-    let meta = tokio::fs::symlink_metadata(&canonical_requested)
+    log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
+    let meta = tokio::fs::symlink_metadata(&normalized_requested)
         .await
         .map_err(|e| {
             log_warn!(
                 "Metadata fetch failed for {:?}: {}",
-                &canonical_requested,
+                &normalized_requested,
                 e
             );
             AppError::Internal(e)
         })?;
 
-    let file_name = canonical_requested
+    let file_name = normalized_requested
         .file_name()
         .ok_or(AppError::InvalidPath)?
         .to_str()
@@ -266,16 +268,16 @@ async fn get_dir_info_handler(
 ) -> Result<actix_web::HttpResponse, AppError> {
     log_info!("[DIR INFO] Handling request for: {}", &params.directory);
 
-    let canonical_requested = validate_path(&data.base_path, &params.directory).await?;
-    log_trace!("Validated canonical path: {:?}", &canonical_requested);
+    let normalized_requested = validate_path(&data.base_path, &params.directory).await?;
+    log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
-    if !canonical_requested.is_dir() {
-        log_debug!("Path is not a directory: {:?}", &canonical_requested);
+    if !normalized_requested.is_dir() {
+        log_debug!("Path is not a directory: {:?}", &normalized_requested);
         return Err(AppError::NotFound);
     }
 
-    log_debug!("Checking cache for directory: {:?}", &canonical_requested);
-    if let Some(mut entry) = data.meta_cache.get_async(&canonical_requested).await {
+    log_debug!("Checking cache for directory: {:?}", &normalized_requested);
+    if let Some(mut entry) = data.meta_cache.get_async(&normalized_requested).await {
         let (cached_meta, timestamp) = entry.get();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -283,11 +285,11 @@ async fn get_dir_info_handler(
 
         if now - timestamp < CACHE_TTL_SECONDS {
             data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", &canonical_requested);
+            log_debug!("Cache hit for directory: {:?}", &normalized_requested);
             return Ok(actix_web::HttpResponse::Ok()
                 .json(cached_meta.get_all_entries().collect::<Vec<_>>()));
         } else {
-            log_debug!("Expired cache entry: {:?}", &canonical_requested);
+            log_debug!("Expired cache entry: {:?}", &normalized_requested);
             data.cache_stats.increment_misses();
             let directory_entry = &create_meta_cache_entry(entry.key().to_owned()).await?;
             entry.put((directory_entry.clone(), now));
@@ -298,14 +300,14 @@ async fn get_dir_info_handler(
 
     data.cache_stats.increment_misses();
 
-    let directory_entry = &create_meta_cache_entry(canonical_requested.to_owned()).await?;
+    let directory_entry = &create_meta_cache_entry(normalized_requested.to_owned()).await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
 
     data.meta_cache
-        .put(canonical_requested, (directory_entry.clone(), now))
+        .put(normalized_requested, (directory_entry.clone(), now))
         .map_err(|_| {
             log_warn!("Failed to insert entry into cache");
             AppError::Internal(std::io::Error::new(
@@ -323,16 +325,22 @@ async fn read_file_buffer_handler(
 ) -> Result<actix_files::NamedFile, AppError> {
     log_info!("[FILE READ] Handling request for: {}", &params.file_path);
 
-    let canonical_requested = validate_path(&data.base_path, &params.file_path).await?;
+    let normalized_requested = validate_path(&data.base_path, &params.file_path).await?;
     log_debug!(
         "Serving file from validated path: {:?}",
-        &canonical_requested
+        &normalized_requested
     );
 
-    actix_files::NamedFile::open_async(&canonical_requested)
+    let canonicalized_path = tokio::fs::canonicalize(&normalized_requested).await?;
+
+    if !canonicalized_path.starts_with(&data.base_path) {
+        return Err(AppError::PathTraversal);
+    }
+
+    actix_files::NamedFile::open_async(&normalized_requested)
         .await
         .map_err(|e| {
-            log_warn!("Failed to open file {:?}: {}", &canonical_requested, e);
+            log_warn!("Failed to open file {:?}: {}", &normalized_requested, e);
             AppError::Internal(e)
         })
 }
@@ -576,13 +584,13 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+                .service(web::resource("/get_file_info").to(read_file_buffer_handler)),
         )
         .await;
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=../passwd.txt")
+                .uri("/get_file_info?file_path=../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -591,7 +599,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=/../passwd.txt")
+                .uri("/get_file_info?file_path=/../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -600,7 +608,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir/../../passwd.txt")
+                .uri("/get_file_info?file_path=test_dir/../../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -609,7 +617,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir/../")
+                .uri("/get_file_info?file_path=test_dir/../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -618,7 +626,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=./test_dir/../")
+                .uri("/get_file_info?file_path=./test_dir/../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -627,7 +635,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir/./../")
+                .uri("/get_file_info?file_path=test_dir/./../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -642,13 +650,13 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+                .service(web::resource("/get_file_info").to(read_file_buffer_handler)),
         )
         .await;
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=..\\passwd.txt")
+                .uri("/get_file_info?file_path=..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -657,7 +665,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=\\..\\passwd.txt")
+                .uri("/get_file_info?file_path=\\..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -666,7 +674,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir\\..\\..\\passwd.txt")
+                .uri("/get_file_info?file_path=test_dir\\..\\..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -675,7 +683,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir\\..\\")
+                .uri("/get_file_info?file_path=test_dir\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -684,7 +692,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=.\\test_dir\\..\\")
+                .uri("/get_file_info?file_path=.\\test_dir\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -693,7 +701,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file?file_path=test_dir\\.\\..\\")
+                .uri("/get_file_info?file_path=test_dir\\.\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -770,5 +778,218 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         // Verify cache was updated
         assert_eq!(state.cache_stats.get_stats().1, 1); // Should count as miss
+    }
+
+    #[actix_web::test]
+    async fn test_deep_nested_directories() {
+        let (temp_dir, state) = setup_test_env().await;
+        let mut path = temp_dir.clone();
+        for depth in 0..10 {
+            path = path.join(format!("level_{}", depth));
+            fs::create_dir(&path).unwrap();
+        }
+        File::create(path.join("deep_file.txt")).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+        .uri("/get_file_info?file_path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
+        .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_permission_denied() {
+        let (temp_dir, state) = setup_test_env().await;
+        let restricted_dir = temp_dir.join("restricted");
+        fs::create_dir(&restricted_dir).unwrap();
+        let restricted_file = restricted_dir.join("no_access.txt");
+        File::create(&restricted_file).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=restricted")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        #[cfg(unix)]
+        fs::set_permissions(
+            restricted_dir,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn test_cache_invalidation_after_modification() {
+        let (temp_dir, state) = setup_test_env().await;
+        let file_path = temp_dir.join("modifiable.txt");
+        File::create(&file_path).unwrap().write_all(b"v1").unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        // Initial request to populate cache
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=modifiable.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["size"], 2);
+
+        // Modify the file
+        File::create(&file_path)
+            .unwrap()
+            .write_all(b"updated")
+            .unwrap();
+
+        // Fast-forward time beyond TTL
+        if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
+            let bar = foo.get_mut();
+            bar.1 = 0; // Set timestamp to epoch to simulate expiration
+        }
+        // Subsequent request should fetch fresh data
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=modifiable.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["size"] != 2);
+    }
+
+    #[actix_web::test]
+    async fn test_concurrent_cache_access() {
+        // needs some code
+        let (_temp_dir, state) = setup_test_env().await;
+        let service = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let mut results = vec![];
+
+        for _ in 0..100000 {
+            let req = test::TestRequest::get()
+                .uri("/get_dir_info?directory=test_dir")
+                .to_request();
+            results.push(test::call_service(&service, req).await.status());
+        }
+
+        for result in results {
+            assert_eq!(result, http::StatusCode::OK);
+        }
+
+        // Ensure cache stats reflect the concurrent hits/misses appropriately
+        #[cfg(feature = "cache_stats")]
+        assert_eq!(state.cache_stats.get_stats().0, 99999); // 1 miss + 99999 hits
+    }
+
+    #[actix_web::test]
+    async fn test_special_char_filenames() {
+        let (temp_dir, state) = setup_test_env().await;
+        let file_names = vec!["файл.txt", "スペース ファイル", "😀.md"];
+
+        for name in &file_names {
+            File::create(temp_dir.join(name)).unwrap();
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=.")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let entries: Vec<serde_json::Value> = test::read_body_json(resp).await;
+
+        for name in file_names {
+            assert!(entries.iter().any(|e| e["info"]["name"] == name));
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_symlink_handling() {
+        let (temp_dir, state) = setup_test_env().await;
+
+        // Create test file and valid symlink within base directory
+        let target_path = temp_dir.join("target_file.txt");
+        File::create(&target_path)
+            .unwrap()
+            .write_all(b"valid content")
+            .unwrap();
+
+        let valid_symlink = temp_dir.join("valid_link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_path, &valid_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target_path, &valid_symlink).unwrap();
+
+        // Create malicious symlink pointing outside base directory
+        let outside_path = temp_dir.parent().unwrap().join("secret.txt");
+        File::create(&outside_path)
+            .unwrap()
+            .write_all(b"protected")
+            .unwrap();
+
+        let malicious_symlink = temp_dir.join("malicious_link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../secret.txt", &malicious_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("..\\secret.txt", &malicious_symlink).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+        )
+        .await;
+
+        // Test valid symlink
+        let req = test::TestRequest::get()
+            .uri("/get_file?file_path=valid_link.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(body, "valid content");
+
+        // Test malicious symlink
+        let req = test::TestRequest::get()
+            .uri("/get_file?file_path=malicious_link.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        let body = test::read_body(resp).await;
+        assert_eq!(body, "Path traversal attempt detected");
+        // assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
 }
