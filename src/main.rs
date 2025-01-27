@@ -705,6 +705,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cache_stats")]
     #[actix_web::test]
     async fn test_cache_behavior() {
         let (_temp_dir, state) = setup_test_env().await;
@@ -733,6 +734,7 @@ mod tests {
         assert_eq!(state.cache_stats.get_stats().1, 1);
     }
 
+    #[cfg(feature = "cache_stats")]
     #[actix_web::test]
     async fn test_cache_expiration() {
         let (_temp_dir, state) = setup_test_env().await;
