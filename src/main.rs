@@ -289,7 +289,7 @@ async fn get_dir_info_handler(
         } else {
             log_debug!("Expired cache entry: {:?}", &canonical_requested);
             data.cache_stats.increment_misses();
-            let directory_entry = create_meta_cache_entry(entry.key().to_owned()).await?;
+            let directory_entry = &create_meta_cache_entry(entry.key().to_owned()).await?;
             entry.put((directory_entry.clone(), now));
             return Ok(actix_web::HttpResponse::Ok()
                 .json(directory_entry.get_all_entries().collect::<Vec<_>>()));
@@ -298,7 +298,7 @@ async fn get_dir_info_handler(
 
     data.cache_stats.increment_misses();
 
-    let directory_entry = create_meta_cache_entry(canonical_requested.to_owned()).await?;
+    let directory_entry = &create_meta_cache_entry(canonical_requested.to_owned()).await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
