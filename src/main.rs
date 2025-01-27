@@ -101,13 +101,12 @@ async fn validate_path(
 
     match requested {
         Some(requested) => {
-            println!("{:?}", base_dir.join(&requested));
-            return Ok(base_dir.join(requested));
+            Ok(base_dir.join(requested))
         }
         None => {
-            return Ok(base_dir.to_owned());
+            Ok(base_dir.to_owned())
         }
-    };
+    }
 }
 
 async fn get_file_info_handler(
