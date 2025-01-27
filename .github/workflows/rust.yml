@@ -1,0 +1,37 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build with no features
+      run: cargo build --no-default-features --verbose
+    - name: Build with logging
+      run: cargo build --features logging --verbose
+    - name: Build with cache_stats
+      run: cargo build --features cache_stats --verbose
+    - name: Run tests with no features
+      run: cargo test --no-default-features --verbose
+    - name: Run tests with logging
+      run: cargo test --features logging --verbose
+    - name: Run tests with cache_stats
+      run: cargo test --features cache_stats --verbose
+    - name: Run clippy with no features
+      run: cargo clippy --no-default-features
+    - name: Run clippy with logging
+      run: cargo clippy --features logging
+    - name: Run clippy with cache_stats
+      run: cargo clippy --features cache_stats
+
