@@ -1,5 +1,9 @@
 mod utils;
 
+// TODO:
+// We need to use inotify for cache invalidation, we can then remove timestamp coupled to each entry
+// We should probably introduce some more sophisticated tests
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("Path traversal attempt detected")]
@@ -27,7 +31,7 @@ impl actix_web::ResponseError for AppError {
                 actix_web::HttpResponse::BadRequest().body(self.to_string())
             }
             AppError::NotFound => actix_web::HttpResponse::NotFound().body(self.to_string()),
-            _ => actix_web::HttpResponse::InternalServerError().body("Internal Server Error"),
+            _ => actix_web::HttpResponse::NotFound().body("Resource not found"),
         }
     }
 }
@@ -56,6 +60,33 @@ struct AppState {
 
 const CACHE_TTL_SECONDS: u64 = 300;
 
+async fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
+    let mut stack = Vec::new();
+
+    // Split the path into segments based on `/`
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {
+                continue;
+            }
+            ".." => {
+                if stack.pop().is_none() {
+                    return Err(AppError::PathTraversal);
+                }
+            }
+            _ => {
+                stack.push(segment);
+            }
+        }
+    }
+
+    if stack.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stack.join("/")))
+    }
+}
+
 async fn validate_path(
     base_dir: &std::path::Path,
     requested_path: &str,
@@ -66,40 +97,17 @@ async fn validate_path(
         base_dir
     );
 
-    let requested = base_dir.join(requested_path);
-    log_trace!("Constructed full requested path: {:?}", &requested);
+    let requested = dedotify_path(&requested_path.replace('\\', "/")).await?;
 
-    let canonical_requested = requested.canonicalize().map_err(|e| {
-        log_debug!("Path resolution failed for '{}': {}", requested_path, e);
-        if let std::io::ErrorKind::NotFound = e.kind() {
-            log_info!("Path not found: '{}'", requested_path);
-            AppError::NotFound
-        } else {
-            log_warn!(
-                "Unexpected error resolving path '{}': {}",
-                requested_path,
-                e
-            );
-            AppError::Internal(e)
+    match requested {
+        Some(requested) => {
+            println!("{:?}", base_dir.join(&requested));
+            return Ok(base_dir.join(requested));
         }
-    })?;
-
-    log_debug!(
-        "Path resolution complete - Requested: {:?}",
-        &canonical_requested
-    );
-
-    if !canonical_requested.starts_with(base_dir) {
-        log_warn!(
-            "Path traversal attempt! Base: {:?}, Attempted: {:?}",
-            &base_dir,
-            &canonical_requested
-        );
-        Err(AppError::PathTraversal)
-    } else {
-        log_trace!("Path validation successful for {:?}", &canonical_requested);
-        Ok(canonical_requested)
-    }
+        None => {
+            return Ok(base_dir.to_owned());
+        }
+    };
 }
 
 async fn get_file_info_handler(
@@ -190,46 +198,14 @@ async fn get_file_info_handler(
     Ok(actix_web::HttpResponse::Ok().json(&file_entry))
 }
 
-async fn get_dir_info_handler(
-    data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<DirQuery>,
-) -> Result<actix_web::HttpResponse, AppError> {
-    log_info!("[DIR INFO] Handling request for: {}", &params.directory);
-
-    let canonical_requested = validate_path(&data.base_path, &params.directory).await?;
-    log_trace!("Validated canonical path: {:?}", &canonical_requested);
-
-    if !canonical_requested.is_dir() {
-        log_debug!("Path is not a directory: {:?}", &canonical_requested);
-        return Err(AppError::NotFound);
-    }
-
-    log_debug!("Checking cache for directory: {:?}", &canonical_requested);
-    if let Some(entry) = data.meta_cache.get_async(&canonical_requested).await {
-        let (cached_meta, timestamp) = entry.get();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
-        if now - timestamp < CACHE_TTL_SECONDS {
-            data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", &canonical_requested);
-            return Ok(actix_web::HttpResponse::Ok()
-                .json(cached_meta.get_all_entries().collect::<Vec<_>>()));
-        }
-    }
-
-    data.cache_stats.increment_misses();
-    log_debug!(
-        "Building new cache entry for directory: {:?}",
-        &canonical_requested
-    );
-
-    let entry = tokio::task::spawn_blocking({
-        let path = canonical_requested.clone();
-        let data = data.clone();
+async fn create_meta_cache_entry(
+    path: std::path::PathBuf,
+) -> Result<utils::cache::metadata::DirectoryLookupContext, AppError> {
+    log_debug!("Building new cache entry for directory: {:?}", &path);
+    tokio::task::spawn_blocking({
         move || -> Result<_, AppError> {
             log_debug!("Scanning directory: {:?}", &path);
+
             let mut cache_entry = utils::cache::metadata::DirectoryLookupContext::new();
             let dir = std::fs::read_dir(&path).map_err(|e| {
                 log_warn_with_context!(e, "Failed to read directory {:?}", &path);
@@ -277,22 +253,7 @@ async fn get_dir_info_handler(
                     }
                 }
             }
-
             log_info!("Directory scan complete - Path: {:?}", &path);
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-
-            data.meta_cache
-                .put(path, (cache_entry.clone(), now))
-                .map_err(|_| {
-                    log_warn!("Failed to insert entry into cache");
-                    AppError::Internal(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Cache insertion failed",
-                    ))
-                })?;
 
             Ok(cache_entry)
         }
@@ -301,9 +262,64 @@ async fn get_dir_info_handler(
     .map_err(|e| {
         log_error!("Directory processing task failed: {}", e);
         AppError::TaskJoin(e)
-    })??;
+    })?
+}
 
-    Ok(actix_web::HttpResponse::Ok().json(entry.get_all_entries().collect::<Vec<_>>()))
+async fn get_dir_info_handler(
+    data: actix_web::web::Data<AppState>,
+    params: actix_web::web::Query<DirQuery>,
+) -> Result<actix_web::HttpResponse, AppError> {
+    log_info!("[DIR INFO] Handling request for: {}", &params.directory);
+
+    let canonical_requested = validate_path(&data.base_path, &params.directory).await?;
+    log_trace!("Validated canonical path: {:?}", &canonical_requested);
+
+    if !canonical_requested.is_dir() {
+        log_debug!("Path is not a directory: {:?}", &canonical_requested);
+        return Err(AppError::NotFound);
+    }
+
+    log_debug!("Checking cache for directory: {:?}", &canonical_requested);
+    if let Some(mut entry) = data.meta_cache.get_async(&canonical_requested).await {
+        let (cached_meta, timestamp) = entry.get();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        if now - timestamp < CACHE_TTL_SECONDS {
+            data.cache_stats.increment_hits();
+            log_debug!("Cache hit for directory: {:?}", &canonical_requested);
+            return Ok(actix_web::HttpResponse::Ok()
+                .json(cached_meta.get_all_entries().collect::<Vec<_>>()));
+        } else {
+            log_debug!("Expired cache entry: {:?}", &canonical_requested);
+            data.cache_stats.increment_misses();
+            let directory_entry = create_meta_cache_entry(entry.key().to_owned()).await?;
+            entry.put((directory_entry.clone(), now));
+            return Ok(actix_web::HttpResponse::Ok()
+                .json(directory_entry.get_all_entries().collect::<Vec<_>>()));
+        }
+    }
+
+    data.cache_stats.increment_misses();
+
+    let directory_entry = create_meta_cache_entry(canonical_requested.to_owned()).await?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    data.meta_cache
+        .put(canonical_requested, (directory_entry.clone(), now))
+        .map_err(|_| {
+            log_warn!("Failed to insert entry into cache");
+            AppError::Internal(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Cache insertion failed",
+            ))
+        })?;
+
+    Ok(actix_web::HttpResponse::Ok().json(directory_entry.get_all_entries().collect::<Vec<_>>()))
 }
 
 async fn read_file_buffer_handler(
@@ -441,4 +457,321 @@ fn start_cache_stat_logger(state: actix_web::web::Data<AppState>) {
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http, test, web, App};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    // Test setup helper
+    async fn setup_test_env() -> (PathBuf, web::Data<AppState>) {
+        let base_dir = tempfile::tempdir().unwrap().into_path();
+        // Create test files
+        fs::create_dir(base_dir.join("test_dir")).unwrap();
+        File::create(base_dir.join("test_file.txt"))
+            .unwrap()
+            .write_all(b"test content")
+            .unwrap();
+        File::create(base_dir.join("test_dir/file_in_dir.txt"))
+            .unwrap()
+            .write_all(b"nested content")
+            .unwrap();
+
+        let state = web::Data::new(AppState {
+            meta_cache: scc::HashCache::with_capacity(1000, 20000),
+            base_path: base_dir.clone(),
+            cache_stats: utils::stats::CacheStats::new(),
+        });
+
+        (base_dir, state)
+    }
+
+    #[actix_web::test]
+    async fn test_valid_file_info() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=test_file.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["name"], "test_file.txt");
+        assert_eq!(body["size"], 12);
+    }
+
+    #[actix_web::test]
+    async fn test_nonexistent_file_info() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=nonexistent.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_directory_info() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=test_dir")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body: Vec<serde_json::Value> = test::read_body_json(resp).await;
+        assert!(!body.is_empty());
+        assert_eq!(body[0]["info"]["name"], "file_in_dir.txt");
+    }
+
+    #[actix_web::test]
+    async fn test_file_download() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_file?file_path=test_file.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(body, "test content");
+    }
+
+    #[actix_web::test]
+    async fn test_path_traversal_protection_posix() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+        )
+        .await;
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=../passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=/../passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir/../../passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir/../")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=./test_dir/../")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir/./../")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_path_traversal_protection_windows() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file").to(read_file_buffer_handler)),
+        )
+        .await;
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=..\\passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=\\..\\passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir\\..\\..\\passwd.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir\\..\\")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=.\\test_dir\\..\\")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = test::TestRequest::get()
+                .uri("/get_file?file_path=test_dir\\.\\..\\")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_cache_behavior() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        // First request (cache miss)
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=test_dir")
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+        assert_eq!(state.cache_stats.get_stats().0, 0);
+        assert_eq!(state.cache_stats.get_stats().1, 1);
+
+        // Second request (cache hit)
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=test_dir")
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+        assert_eq!(state.cache_stats.get_stats().0, 1);
+        assert_eq!(state.cache_stats.get_stats().1, 1);
+    }
+
+    #[actix_web::test]
+    async fn test_cache_expiration() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        // Manually insert an expired cache entry
+        let path = state.base_path.join("test_dir");
+        let old_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - CACHE_TTL_SECONDS
+            - 1;
+
+        state
+            .meta_cache
+            .put(
+                path.clone(),
+                (
+                    utils::cache::metadata::DirectoryLookupContext::new(),
+                    old_time,
+                ),
+            )
+            .unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=test_dir")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        // Verify cache was updated
+        assert_eq!(state.cache_stats.get_stats().1, 1); // Should count as miss
+    }
 }
