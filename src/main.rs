@@ -100,12 +100,8 @@ async fn validate_path(
     let requested = dedotify_path(&requested_path.replace('\\', "/")).await?;
 
     match requested {
-        Some(requested) => {
-            Ok(base_dir.join(requested))
-        }
-        None => {
-            Ok(base_dir.to_owned())
-        }
+        Some(requested) => Ok(base_dir.join(requested)),
+        None => Ok(base_dir.to_owned()),
     }
 }
 
