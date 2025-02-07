@@ -1,8 +1,10 @@
+#![deny(clippy::all)]
+mod generated;
 mod utils;
 
 // TODO:
 // We need to use inotify for cache invalidation, we can then remove timestamp coupled to each entry
-// We should probably introduce some more sophisticated tests
+// We need to investigate compression on /get_dir_info and /get_file_info
 
 #[derive(Debug, thiserror::Error)]
 enum AppError {
@@ -20,18 +22,23 @@ enum AppError {
     SystemTime(#[from] std::time::SystemTimeError),
     #[error("Task execution failed")]
     TaskJoin(#[from] tokio::task::JoinError),
+    #[error("Numerical conversion error")]
+    TryFromIntError(#[from] std::num::TryFromIntError),
 }
 
 impl actix_web::ResponseError for AppError {
     fn error_response(&self) -> actix_web::HttpResponse {
         log_error!("API error: {}", self);
         match self {
-            AppError::PathTraversal => actix_web::HttpResponse::Forbidden().body(self.to_string()),
-            AppError::InvalidPathEncoding | AppError::InvalidPath => {
+            Self::PathTraversal => actix_web::HttpResponse::Forbidden().body(self.to_string()),
+            Self::InvalidPathEncoding | Self::InvalidPath => {
                 actix_web::HttpResponse::BadRequest().body(self.to_string())
             }
-            AppError::NotFound => actix_web::HttpResponse::NotFound().body(self.to_string()),
-            AppError::Internal(_) | AppError::SystemTime(_) | AppError::TaskJoin(_) => {
+            Self::NotFound => actix_web::HttpResponse::NotFound().body(self.to_string()),
+            Self::Internal(_)
+            | Self::SystemTime(_)
+            | Self::TaskJoin(_)
+            | Self::TryFromIntError(_) => {
                 actix_web::HttpResponse::InternalServerError().body("Internal server error")
             }
         }
@@ -57,12 +64,12 @@ struct AppState {
     meta_cache:
         scc::HashCache<std::path::PathBuf, (utils::cache::metadata::DirectoryLookupContext, u64)>,
     base_path: std::path::PathBuf,
-    cache_stats: utils::stats::CacheStats,
+    cache_stats: utils::stats::Cache,
 }
 
 const CACHE_TTL_SECONDS: u64 = 300;
 
-async fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
+fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     let mut stack = Vec::new();
 
     // Split the path into segments based on `/`
@@ -89,7 +96,30 @@ async fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     }
 }
 
-async fn validate_path(
+fn create_buffer(metadata: &std::fs::Metadata, name: &str) -> Result<Vec<u8>, AppError> {
+    let mut msg = capnp::message::Builder::new_default();
+    let mut entry =
+        msg.init_root::<crate::generated::metadata_capnp::directory_entry_metadata::Builder>();
+
+    entry.set_name(name.to_owned());
+    entry.set_size(metadata.len());
+    entry.set_modified(
+        metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    );
+    entry.set_accessed(
+        metadata
+            .accessed()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    );
+
+    Ok(capnp::serialize::write_message_to_words(&msg))
+}
+
+fn validate_path(
     base_dir: &std::path::Path,
     requested_path: &str,
 ) -> Result<std::path::PathBuf, AppError> {
@@ -99,12 +129,12 @@ async fn validate_path(
         base_dir
     );
 
-    let requested = dedotify_path(&requested_path.replace('\\', "/")).await?;
+    let requested = dedotify_path(&requested_path.replace('\\', "/"))?;
 
-    match requested {
-        Some(requested) => Ok(base_dir.join(requested)),
-        None => Ok(base_dir.to_owned()),
-    }
+    requested.map_or_else(
+        || Ok(base_dir.to_owned()),
+        |requested| Ok(base_dir.join(requested)),
+    )
 }
 
 async fn get_file_info_handler(
@@ -113,7 +143,7 @@ async fn get_file_info_handler(
 ) -> Result<actix_web::HttpResponse, AppError> {
     log_info!("[FILE INFO] Handling request for: {}", &params.file_path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.file_path).await?;
+    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
     log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
     if !normalized_requested.is_file() {
@@ -153,9 +183,10 @@ async fn get_file_info_handler(
                 .ok_or(AppError::InvalidPathEncoding)?;
 
             log_trace!("Looking for file in cache: {}", file_name);
+
             if let Some(dir_ent) = cached_meta.get_file(file_name) {
                 log_debug!("File found in cache: {}", file_name);
-                return Ok(actix_web::HttpResponse::Ok().json(dir_ent));
+                return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ent)));
             }
         } else {
             log_debug!("Cache entry expired for: {:?}", parent_dir);
@@ -184,7 +215,7 @@ async fn get_file_info_handler(
         .to_str()
         .ok_or(AppError::InvalidPathEncoding)?;
 
-    let file_entry = utils::cache::metadata::create_direntmeta(&meta, file_name).map_err(|e| {
+    let file_entry = create_buffer(&meta, file_name).map_err(|e| {
         log_error_with_context!(e, "Failed to create directory entry for {}", file_name);
         AppError::Internal(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -192,7 +223,7 @@ async fn get_file_info_handler(
         ))
     })?;
 
-    Ok(actix_web::HttpResponse::Ok().json(&file_entry))
+    Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(file_entry)))
 }
 
 async fn create_meta_cache_entry(
@@ -214,30 +245,17 @@ async fn create_meta_cache_entry(
                     Ok(entry) => {
                         log_trace!("Processing entry: {:?}", entry.path());
 
-                        let name = if let Ok(name) = entry.file_name().into_string() {
-                            name
-                        } else {
+                        let Ok(name) = entry.file_name().into_string() else {
                             log_debug!("Invalid filename encoding: {:?}", &entry.path());
                             continue;
                         };
 
                         match entry.metadata() {
                             Ok(metadata) => {
-                                match utils::cache::metadata::create_direntmeta(&metadata, &name) {
-                                    Ok(direntmeta) => {
-                                        if metadata.is_dir() {
-                                            cache_entry.add_subdir(direntmeta);
-                                        } else {
-                                            cache_entry.add_file(direntmeta);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log_debug_with_context!(
-                                            e,
-                                            "Failed to create direntmeta for {}",
-                                            &name
-                                        );
-                                    }
+                                if metadata.is_dir() {
+                                    cache_entry.add_subdir(&metadata, &name);
+                                } else {
+                                    cache_entry.add_file(&metadata, &name);
                                 }
                             }
                             Err(e) => {
@@ -268,7 +286,7 @@ async fn get_dir_info_handler(
 ) -> Result<actix_web::HttpResponse, AppError> {
     log_info!("[DIR INFO] Handling request for: {}", &params.directory);
 
-    let normalized_requested = validate_path(&data.base_path, &params.directory).await?;
+    let normalized_requested = validate_path(&data.base_path, &params.directory)?;
     log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
     if !normalized_requested.is_dir() {
@@ -277,8 +295,8 @@ async fn get_dir_info_handler(
     }
 
     log_debug!("Checking cache for directory: {:?}", &normalized_requested);
-    if let Some(mut entry) = data.meta_cache.get_async(&normalized_requested).await {
-        let (cached_meta, timestamp) = entry.get();
+    if let Some(mut cache_entry) = data.meta_cache.get_async(&normalized_requested).await {
+        let (cached_dir_meta, timestamp) = cache_entry.get();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -286,21 +304,21 @@ async fn get_dir_info_handler(
         if now - timestamp < CACHE_TTL_SECONDS {
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", &normalized_requested);
-            return Ok(actix_web::HttpResponse::Ok()
-                .json(cached_meta.get_all_entries().collect::<Vec<_>>()));
-        } else {
-            log_debug!("Expired cache entry: {:?}", &normalized_requested);
-            data.cache_stats.increment_misses();
-            let directory_entry = &create_meta_cache_entry(entry.key().to_owned()).await?;
-            entry.put((directory_entry.clone(), now));
-            return Ok(actix_web::HttpResponse::Ok()
-                .json(directory_entry.get_all_entries().collect::<Vec<_>>()));
+            let dir_ents = cached_dir_meta.get_all_entries()?;
+            return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
         }
+
+        log_debug!("Expired cache entry: {:?}", &normalized_requested);
+        data.cache_stats.increment_misses();
+        let directory_entry = &create_meta_cache_entry(cache_entry.key().to_owned()).await?;
+        cache_entry.put((directory_entry.clone(), now));
+        let dir_ents = directory_entry.get_all_entries()?;
+        return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
     }
 
     data.cache_stats.increment_misses();
 
-    let directory_entry = &create_meta_cache_entry(normalized_requested.to_owned()).await?;
+    let directory_entry = &create_meta_cache_entry(normalized_requested.clone()).await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -316,7 +334,8 @@ async fn get_dir_info_handler(
             ))
         })?;
 
-    Ok(actix_web::HttpResponse::Ok().json(directory_entry.get_all_entries().collect::<Vec<_>>()))
+    let dir_ents = directory_entry.get_all_entries()?;
+    Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)))
 }
 
 async fn read_file_buffer_handler(
@@ -325,7 +344,7 @@ async fn read_file_buffer_handler(
 ) -> Result<actix_files::NamedFile, AppError> {
     log_info!("[FILE READ] Handling request for: {}", &params.file_path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.file_path).await?;
+    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
     log_debug!(
         "Serving file from validated path: {:?}",
         &normalized_requested
@@ -353,7 +372,9 @@ async fn main() -> std::io::Result<()> {
     let path_argument = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!(
             "Usage: {} <directory-path>",
-            std::env::args().next().unwrap_or("server-rs".to_owned())
+            std::env::args()
+                .next()
+                .unwrap_or_else(|| "server-rs".to_owned())
         );
         std::process::exit(1);
     });
@@ -401,11 +422,11 @@ async fn main() -> std::io::Result<()> {
     let state = actix_web::web::Data::new(AppState {
         meta_cache: scc::HashCache::with_capacity(1000, 20000),
         base_path: path.clone(),
-        cache_stats: utils::stats::CacheStats::new(),
+        cache_stats: utils::stats::Cache::new(),
     });
 
-    #[cfg(feature = "cache_stats")]
-    start_cache_stat_logger(state.clone());
+    #[cfg(feature = "stats")]
+    start_cache_statistics_logger(state.clone());
 
     log_info!("Starting server on port {} serving path: {:?}", port, &path);
     actix_web::HttpServer::new(move || {
@@ -434,8 +455,8 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-#[cfg(feature = "cache_stats")]
-fn start_cache_stat_logger(state: actix_web::web::Data<AppState>) {
+#[cfg(feature = "stats")]
+fn start_cache_statistics_logger(state: actix_web::web::Data<AppState>) {
     const STATS_LOG_INTERVAL_SECONDS: u64 = 30;
 
     actix_web::rt::spawn(async move {
@@ -443,7 +464,7 @@ fn start_cache_stat_logger(state: actix_web::web::Data<AppState>) {
             tokio::time::interval(std::time::Duration::from_secs(STATS_LOG_INTERVAL_SECONDS));
         loop {
             interval.tick().await;
-            let (hits, misses) = state.cache_stats.get_stats();
+            let (hits, misses) = state.cache_stats.get();
             let total = hits + misses;
             let hit_rate = if total > 0 {
                 (hits as f64 / total as f64) * 100.0
@@ -466,6 +487,7 @@ fn start_cache_stat_logger(state: actix_web::web::Data<AppState>) {
 mod tests {
     use super::*;
     use actix_web::{http, test, web, App};
+    use capnp::serialize;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
@@ -487,7 +509,7 @@ mod tests {
         let state = web::Data::new(AppState {
             meta_cache: scc::HashCache::with_capacity(1000, 20000),
             base_path: base_dir.clone(),
-            cache_stats: utils::stats::CacheStats::new(),
+            cache_stats: utils::stats::Cache::new(),
         });
 
         (base_dir, state)
@@ -510,9 +532,19 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), http::StatusCode::OK);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert_eq!(body["name"], "test_file.txt");
-        assert_eq!(body["size"], 12);
+
+        let body = test::read_body(resp).await;
+
+        let message_reader = serialize::read_message(body.as_ref(), Default::default())
+            .expect("Failed to parse Cap'n Proto message");
+
+        // Return both reader and root to maintain proper lifetimes
+        let root = message_reader
+            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
+            .expect("Failed to get root reader");
+
+        assert_eq!(root.get_name().unwrap(), "test_file.txt");
+        assert_eq!(root.get_size(), 12);
     }
 
     #[actix_web::test]
@@ -551,9 +583,21 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), http::StatusCode::OK);
-        let body: Vec<serde_json::Value> = test::read_body_json(resp).await;
-        assert!(!body.is_empty());
-        assert_eq!(body[0]["info"]["name"], "file_in_dir.txt");
+
+        let body = test::read_body(resp).await;
+
+        let message_reader = serialize::read_message(body.as_ref(), Default::default())
+            .expect("Failed to parse Cap'n Proto message");
+
+        // Return both reader and root to maintain proper lifetimes
+        let root = message_reader
+            .get_root::<crate::generated::metadata_capnp::directory_entries_metadata::Reader>()
+            .expect("Failed to get root reader");
+
+        let entries = root.get_name().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.get(0).unwrap(), "file_in_dir.txt");
     }
 
     #[actix_web::test]
@@ -709,7 +753,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cache_stats")]
+    #[cfg(feature = "stats")]
     #[actix_web::test]
     async fn test_cache_behavior() {
         let (_temp_dir, state) = setup_test_env().await;
@@ -726,19 +770,19 @@ mod tests {
             .uri("/get_dir_info?directory=test_dir")
             .to_request();
         let _ = test::call_service(&app, req).await;
-        assert_eq!(state.cache_stats.get_stats().0, 0);
-        assert_eq!(state.cache_stats.get_stats().1, 1);
+        assert_eq!(state.cache_stats.get().0, 0);
+        assert_eq!(state.cache_stats.get().1, 1);
 
         // Second request (cache hit)
         let req = test::TestRequest::get()
             .uri("/get_dir_info?directory=test_dir")
             .to_request();
         let _ = test::call_service(&app, req).await;
-        assert_eq!(state.cache_stats.get_stats().0, 1);
-        assert_eq!(state.cache_stats.get_stats().1, 1);
+        assert_eq!(state.cache_stats.get().0, 1);
+        assert_eq!(state.cache_stats.get().1, 1);
     }
 
-    #[cfg(feature = "cache_stats")]
+    #[cfg(feature = "stats")]
     #[actix_web::test]
     async fn test_cache_expiration() {
         let (_temp_dir, state) = setup_test_env().await;
@@ -777,7 +821,7 @@ mod tests {
 
         assert_eq!(resp.status(), http::StatusCode::OK);
         // Verify cache was updated
-        assert_eq!(state.cache_stats.get_stats().1, 1); // Should count as miss
+        assert_eq!(state.cache_stats.get().1, 1); // Should count as miss
     }
 
     #[actix_web::test]
@@ -857,8 +901,18 @@ mod tests {
             .uri("/get_file_info?file_path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert_eq!(body["size"], 2);
+
+        let body = test::read_body(resp).await;
+
+        let message_reader = serialize::read_message(body.as_ref(), Default::default())
+            .expect("Failed to parse Cap'n Proto message");
+
+        // Return both reader and root to maintain proper lifetimes
+        let root = message_reader
+            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
+            .expect("Failed to get root reader");
+
+        assert_eq!(root.get_size(), 2);
 
         // Modify the file
         File::create(&file_path)
@@ -876,8 +930,18 @@ mod tests {
             .uri("/get_file_info?file_path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert!(body["size"] != 2);
+
+        let body = test::read_body(resp).await;
+
+        let message_reader = serialize::read_message(body.as_ref(), Default::default())
+            .expect("Failed to parse Cap'n Proto message");
+
+        // Return both reader and root to maintain proper lifetimes
+        let root = message_reader
+            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
+            .expect("Failed to get root reader");
+
+        assert_ne!(root.get_size(), 2);
     }
 
     #[actix_web::test]
@@ -905,8 +969,8 @@ mod tests {
         }
 
         // Ensure cache stats reflect the concurrent hits/misses appropriately
-        #[cfg(feature = "cache_stats")]
-        assert_eq!(state.cache_stats.get_stats().0, 99999); // 1 miss + 99999 hits
+        #[cfg(feature = "stats")]
+        assert_eq!(state.cache_stats.get().0, 99999); // 1 miss + 99999 hits
     }
 
     #[actix_web::test]
@@ -929,10 +993,21 @@ mod tests {
             .uri("/get_dir_info?directory=.")
             .to_request();
         let resp = test::call_service(&app, req).await;
-        let entries: Vec<serde_json::Value> = test::read_body_json(resp).await;
+
+        let body = test::read_body(resp).await;
+
+        let message_reader = serialize::read_message(body.as_ref(), Default::default())
+            .expect("Failed to parse Cap'n Proto message");
+
+        // Return both reader and root to maintain proper lifetimes
+        let root = message_reader
+            .get_root::<crate::generated::metadata_capnp::directory_entries_metadata::Reader>()
+            .expect("Failed to get root reader");
+
+        let entries = root.get_name().unwrap();
 
         for name in file_names {
-            assert!(entries.iter().any(|e| e["info"]["name"] == name));
+            assert!(entries.iter().any(|e| e.unwrap() == name));
         }
     }
 
@@ -987,9 +1062,8 @@ mod tests {
             .uri("/get_file?file_path=malicious_link.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
-
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         let body = test::read_body(resp).await;
         assert_eq!(body, "Path traversal attempt detected");
-        // assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
 }

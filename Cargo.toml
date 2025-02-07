@@ -4,42 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = [ "cache_stats" ]
+default = [ "stats" ]
 logging = ["dep:log", "dep:env_logger"]
-cache_stats = ["logging"]
+stats = ["logging"]
 
 [dependencies]
 actix-files = "0.6.6"
 actix-web = "4.9.0"
+capnp = "0.20.3"
 env_logger = { version = "0.11.6", optional = true }
 log = { version = "0.4.25", optional = true }
-notify = "8.0.0" 
 scc = "2.3.0"
 serde = { version = "1.0.217", features = ["derive"] }
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["fs"] }
+
+[build-dependencies]
+capnpc = "0.20.1"
 
 [dev-dependencies]
 tempfile = "3.3.0"
 urlencoding = "2.1.2"
 actix-rt = "2.0"
 tokio = { version = "1.0", features = ["rt", "macros", "test-util"] }
-serde_json = "*"
-
-
-[lints.clippy]
-single_match = "warn"
-single_match_else = "warn"
-needless_match = "warn"
-needless_late_init = "warn"
-redundant_pattern_matching = "warn"
-redundant_pattern = "warn"
-redundant_guards = "warn"
-collapsible_match = "warn"
-match_single_binding = "warn"
-match_same_arms = "warn"
-match_ref_pats = "warn"
-match_bool = "warn"
-needless_bool = "deny"
-unwrap_used = "warn"
-expect_used = "warn"
