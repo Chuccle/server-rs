@@ -1,19 +1,29 @@
-extern crate capnpc;
-
 fn main() {
-    let generated_dir = "src/generated";
-    capnpc::CompilerCommand::new()
-        .output_path(generated_dir)
-        .src_prefix("schemas")
-        .file("schemas/metadata.capnp")
-        .run()
-        .expect("capnp compiles");
+    let schemas_dir = std::path::Path::new("./schemas");
 
-    for entry in std::fs::read_dir(generated_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            let content = std::fs::read_to_string(&path).unwrap();
-            std::fs::write(&path, format!("#![allow(clippy::all)]\n{}", content)).unwrap();
-        }
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+
+    // Make sure flatc is installed
+    let flatc_status = std::process::Command::new("flatc")
+        .arg("--version")
+        .status()
+        .expect("Failed to execute flatc. Make sure it's installed and in your PATH");
+
+    if !flatc_status.success() {
+        panic!("flatc command failed");
     }
+
+    // Compile the FlatBuffer schema
+    let schema_path = schemas_dir.join("metadata_flatbuffer.fbs");
+    let status = std::process::Command::new("flatc")
+        .args(["--rust", "-o", &out_dir, schema_path.to_str().unwrap()])
+        .status()
+        .expect("Failed to execute flatc command");
+
+    if !status.success() {
+        panic!("flatc compilation failed");
+    }
+
+    // Make cargo watch for changes in schema files
+    println!("cargo:rerun-if-changed=src/schemas/metadata_flatbuffer.fbs");
 }
