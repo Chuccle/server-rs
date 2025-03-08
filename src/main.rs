@@ -554,7 +554,7 @@ mod tests {
         let fb_data: DirectoryEntryMetadata =
             flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
 
-        assert_eq!(fb_data.name().unwrap(), "test_file.txt");
+        assert_eq!(fb_data.name(), "test_file.txt");
         assert_eq!(fb_data.size(), 12);
     }
 
