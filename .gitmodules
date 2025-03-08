@@ -1,6 +1,6 @@
 [submodule "schemas"]
 	path = schemas
-	url = https://github.com/Chuccle/proto-definitions.git
+	url = https://github.com/Chuccle/schemas.git
 [submodule "buildtools/flatbuffers"]
 	path = buildtools/flatbuffers
 	url = https://github.com/google/flatbuffers.git
