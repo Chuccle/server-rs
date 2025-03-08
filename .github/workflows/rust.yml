@@ -20,8 +20,10 @@ jobs:
       with:
         token: ${{ secrets.GH_PAT }}
         submodules: 'recursive'
-    - name: Install capnproto
-      run: sudo apt-get install capnproto
+    - name: Install build tools
+      run: sudo apt install -y cmake make
+    - name: Build Flatc
+      run: cd buildtools/flatbuffers && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && make && sudo make install
     - name: Build with no features
       run: cargo build --no-default-features --verbose
     - name: Build with logging

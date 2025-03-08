@@ -1,11 +1,11 @@
 pub mod metadata {
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Serialize)]
     pub struct DirEntMetaEntries {
         names: Vec<String>,
         sizes: Vec<u64>,
-        modified_times: Vec<crate::utils::windows::time::File>,
-        access_times: Vec<crate::utils::windows::time::File>,
+        modified_times: Vec<u64>,
+        access_times: Vec<u64>,
     }
     impl DirEntMetaEntries {
         pub fn new() -> Self {
@@ -44,16 +44,18 @@ pub mod metadata {
             self.files.names.push(name.to_owned());
             self.files.sizes.push(metadata.len());
             self.files.modified_times.push(
-                metadata
-                    .modified()
-                    .unwrap_or_else(|_| std::time::SystemTime::now())
-                    .into(),
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
             );
             self.files.access_times.push(
-                metadata
-                    .accessed()
-                    .unwrap_or_else(|_| std::time::SystemTime::now())
-                    .into(),
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .accessed()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
             );
         }
 
@@ -63,91 +65,108 @@ pub mod metadata {
             self.sub_dirs.names.push(name.to_owned());
             self.sub_dirs.sizes.push(metadata.len());
             self.sub_dirs.modified_times.push(
-                metadata
-                    .modified()
-                    .unwrap_or_else(|_| std::time::SystemTime::now())
-                    .into(),
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
             );
             self.sub_dirs.access_times.push(
-                metadata
-                    .modified()
-                    .unwrap_or_else(|_| std::time::SystemTime::now())
-                    .into(),
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
             );
         }
 
-        pub fn get_all_entries(&self) -> Result<Vec<u8>, crate::AppError> {
-            let total_entries = self.files.names.len() + self.sub_dirs.names.len();
+        fn create_entries_metadata<'a>(
+            &self,
+            builder: &mut flatbuffers::FlatBufferBuilder<'a>,
+            entries: &DirEntMetaEntries,
+        ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntriesMetadata<'a>>
+        {
+            // First create all string objects
+            let names: Vec<flatbuffers::WIPOffset<_>> = entries
+                .names
+                .iter()
+                .map(|name| builder.create_string(name))
+                .collect();
 
-            let mut msg = capnp::message::Builder::new_default();
-            let mut entries = msg
-                .init_root::<crate::generated::metadata_capnp::directory_entries_metadata::Builder>(
-            );
+            let names_vector = builder.create_vector(&names);
+            let sizes_vector = builder.create_vector(&entries.sizes);
+            let modified_vector = builder.create_vector(&entries.modified_times);
+            let accessed_vector = builder.create_vector(&entries.access_times);
 
-            macro_rules! init_and_set {
-                ($field:ident, $values:expr) => {
-                    let mut field = entries.reborrow().$field(total_entries.try_into()?);
-                    for (i, value) in $values.enumerate() {
-                        field.set(i.try_into()?, value);
-                    }
-                };
-            }
-
-            init_and_set!(
-                init_is_dir,
-                self.files
-                    .names
-                    .iter()
-                    .map(|_| false)
-                    .chain(self.sub_dirs.names.iter().map(|_| true))
-            );
-            init_and_set!(
-                init_name,
-                self.files
-                    .names
-                    .iter()
-                    .chain(&self.sub_dirs.names)
-                    .map(ToOwned::to_owned)
-            );
-            init_and_set!(
-                init_size,
-                self.files.sizes.iter().chain(&self.sub_dirs.sizes).copied()
-            );
-            init_and_set!(
-                init_modified,
-                self.files
-                    .modified_times
-                    .iter()
-                    .chain(&self.sub_dirs.modified_times)
-                    .map(|&t| t.into())
-            );
-            init_and_set!(
-                init_accessed,
-                self.files
-                    .access_times
-                    .iter()
-                    .chain(&self.sub_dirs.access_times)
-                    .map(|&t| t.into())
-            );
-
-            Ok(capnp::serialize::write_message_to_words(&msg))
+            crate::generated::blorg_meta_flat::DirectoryEntriesMetadata::create(
+                builder,
+                &crate::generated::blorg_meta_flat::DirectoryEntriesMetadataArgs {
+                    name: Some(names_vector),
+                    size: Some(sizes_vector),
+                    modified: Some(modified_vector),
+                    accessed: Some(accessed_vector),
+                },
+            )
         }
 
-        pub fn get_file(&self, name: &str) -> Option<Vec<u8>> {
-            let mut msg = capnp::message::Builder::new_default();
-            let mut entry = msg
-                .init_root::<crate::generated::metadata_capnp::directory_entry_metadata::Builder>();
+        pub fn get_all_entries_serialized(&self) -> Vec<u8> {
+            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(
+                Self::estimate_serialized_size(self.files.names.len() + self.sub_dirs.names.len())
+                    as usize,
+            );
 
-            if let Some(&index) = self.file_map.get(name) {
-                entry.set_name(self.files.names[index].clone());
-                entry.set_size(self.files.sizes[index]);
-                entry.set_modified(self.files.modified_times[index].into());
-                entry.set_accessed(self.files.access_times[index].into());
+            let directories = self.create_entries_metadata(&mut builder, &self.sub_dirs);
 
-                return Some(capnp::serialize::write_message_to_words(&msg));
-            }
+            let files = self.create_entries_metadata(&mut builder, &self.files);
 
-            None
+            let directory = crate::generated::blorg_meta_flat::Directory::create(
+                &mut builder,
+                &crate::generated::blorg_meta_flat::DirectoryArgs {
+                    directory_count: self.sub_dirs.names.len() as u64,
+                    file_count: self.files.names.len() as u64,
+                    directories: Some(directories),
+                    files: Some(files),
+                },
+            );
+
+            builder.finish(directory, None);
+            builder.finished_data().to_owned()
+        }
+
+        fn create_entry_metadata<'a>(
+            &self,
+            builder: &mut flatbuffers::FlatBufferBuilder<'a>,
+            idx: usize,
+        ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntryMetadata<'a>>
+        {
+            let file_name = builder.create_string(&self.files.names[idx]);
+
+            crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
+                builder,
+                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
+                    name: Some(file_name),
+                    size: self.files.sizes[idx],
+                    modified: self.files.modified_times[idx],
+                    accessed: self.files.access_times[idx],
+                },
+            )
+        }
+
+        pub fn get_file_serialized(&self, name: &str) -> Option<Vec<u8>> {
+            self.file_map.get(name).map(|&index| {
+                let capacity = Self::estimate_serialized_size(1);
+
+                let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity as usize);
+                let file = self.create_entry_metadata(&mut builder, index);
+                builder.finish(file, None);
+                builder.finished_data().to_vec()
+            })
+        }
+
+        fn estimate_serialized_size(count: usize) -> u64 {
+            (std::mem::size_of::<DirEntMetaEntries>() as u64
+                + crate::utils::windows::file::WINDOWS_MAX_PATH)
+                * count as u64
         }
     }
 }

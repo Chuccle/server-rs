@@ -1,11 +1,17 @@
 #![deny(clippy::all)]
-mod generated;
+
+mod generated {
+    #![allow(clippy::all, unused_imports, dead_code)]
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/metadata_flatbuffer_generated.rs"
+    ));
+}
 mod utils;
 
 // TODO:
 // We need to use inotify for cache invalidation, we can then remove timestamp coupled to each entry
 // We need to investigate compression on /get_dir_info and /get_file_info
-
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("Path traversal attempt detected")]
@@ -96,27 +102,36 @@ fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     }
 }
 
-fn create_buffer(metadata: &std::fs::Metadata, name: &str) -> Result<Vec<u8>, AppError> {
-    let mut msg = capnp::message::Builder::new_default();
-    let mut entry =
-        msg.init_root::<crate::generated::metadata_capnp::directory_entry_metadata::Builder>();
+fn create_buffer_serialized(metadata: &std::fs::Metadata, name: &str) -> Result<Vec<u8>, AppError> {
+    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(512);
 
-    entry.set_name(name.to_owned());
-    entry.set_size(metadata.len());
-    entry.set_modified(
-        metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
-    );
-    entry.set_accessed(
-        metadata
-            .accessed()?
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
+    let name_fb = builder.create_string(name);
+
+    let modified_secs = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let accessed_secs = metadata
+        .accessed()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
+        &mut builder,
+        &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
+            name: Some(name_fb),
+            size: metadata.len(),
+            modified: modified_secs,
+            accessed: accessed_secs,
+        },
     );
 
-    Ok(capnp::serialize::write_message_to_words(&msg))
+    // Finish building the buffer
+    builder.finish(entry, None);
+
+    // Return the serialized buffer
+    Ok(builder.finished_data().to_vec())
 }
 
 fn validate_path(
@@ -184,7 +199,7 @@ async fn get_file_info_handler(
 
             log_trace!("Looking for file in cache: {}", file_name);
 
-            if let Some(dir_ent) = cached_meta.get_file(file_name) {
+            if let Some(dir_ent) = cached_meta.get_file_serialized(file_name) {
                 log_debug!("File found in cache: {}", file_name);
                 return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ent)));
             }
@@ -215,7 +230,7 @@ async fn get_file_info_handler(
         .to_str()
         .ok_or(AppError::InvalidPathEncoding)?;
 
-    let file_entry = create_buffer(&meta, file_name).map_err(|e| {
+    let file_entry = create_buffer_serialized(&meta, file_name).map_err(|e| {
         log_error_with_context!(e, "Failed to create directory entry for {}", file_name);
         AppError::Internal(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -304,7 +319,7 @@ async fn get_dir_info_handler(
         if now - timestamp < CACHE_TTL_SECONDS {
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", &normalized_requested);
-            let dir_ents = cached_dir_meta.get_all_entries()?;
+            let dir_ents = cached_dir_meta.get_all_entries_serialized();
             return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
         }
 
@@ -312,7 +327,7 @@ async fn get_dir_info_handler(
         data.cache_stats.increment_misses();
         let directory_entry = &create_meta_cache_entry(cache_entry.key().to_owned()).await?;
         cache_entry.put((directory_entry.clone(), now));
-        let dir_ents = directory_entry.get_all_entries()?;
+        let dir_ents = directory_entry.get_all_entries_serialized();
         return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
     }
 
@@ -334,7 +349,7 @@ async fn get_dir_info_handler(
             ))
         })?;
 
-    let dir_ents = directory_entry.get_all_entries()?;
+    let dir_ents = directory_entry.get_all_entries_serialized();
     Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)))
 }
 
@@ -487,7 +502,7 @@ fn start_cache_statistics_logger(state: actix_web::web::Data<AppState>) {
 mod tests {
     use super::*;
     use actix_web::{http, test, web, App};
-    use capnp::serialize;
+    use generated::blorg_meta_flat::{Directory, DirectoryEntryMetadata};
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
@@ -535,16 +550,12 @@ mod tests {
 
         let body = test::read_body(resp).await;
 
-        let message_reader = serialize::read_message(body.as_ref(), Default::default())
-            .expect("Failed to parse Cap'n Proto message");
+        // Parse FlatBuffer data
+        let fb_data: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
 
-        // Return both reader and root to maintain proper lifetimes
-        let root = message_reader
-            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
-            .expect("Failed to get root reader");
-
-        assert_eq!(root.get_name().unwrap(), "test_file.txt");
-        assert_eq!(root.get_size(), 12);
+        assert_eq!(fb_data.name().unwrap(), "test_file.txt");
+        assert_eq!(fb_data.size(), 12);
     }
 
     #[actix_web::test]
@@ -586,18 +597,26 @@ mod tests {
 
         let body = test::read_body(resp).await;
 
-        let message_reader = serialize::read_message(body.as_ref(), Default::default())
-            .expect("Failed to parse Cap'n Proto message");
+        // Parse FlatBuffer data
+        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
 
-        // Return both reader and root to maintain proper lifetimes
-        let root = message_reader
-            .get_root::<crate::generated::metadata_capnp::directory_entries_metadata::Reader>()
-            .expect("Failed to get root reader");
+        let directory_count = fb_data.directory_count();
+        let file_count = fb_data.file_count();
 
-        let entries = root.get_name().unwrap();
+        assert_eq!(
+            fb_data.directories().unwrap().name().unwrap().len() as u64,
+            directory_count
+        );
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries.get(0).unwrap(), "file_in_dir.txt");
+        assert_eq!(
+            fb_data.files().unwrap().name().unwrap().len() as u64,
+            file_count
+        );
+
+        assert_eq!(
+            fb_data.files().unwrap().name().unwrap().get(0),
+            "file_in_dir.txt"
+        );
     }
 
     #[actix_web::test]
@@ -904,15 +923,10 @@ mod tests {
 
         let body = test::read_body(resp).await;
 
-        let message_reader = serialize::read_message(body.as_ref(), Default::default())
-            .expect("Failed to parse Cap'n Proto message");
+        let fb_data: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
 
-        // Return both reader and root to maintain proper lifetimes
-        let root = message_reader
-            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
-            .expect("Failed to get root reader");
-
-        assert_eq!(root.get_size(), 2);
+        assert_eq!(fb_data.size(), 2);
 
         // Modify the file
         File::create(&file_path)
@@ -933,15 +947,10 @@ mod tests {
 
         let body = test::read_body(resp).await;
 
-        let message_reader = serialize::read_message(body.as_ref(), Default::default())
-            .expect("Failed to parse Cap'n Proto message");
+        let fb_data: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
 
-        // Return both reader and root to maintain proper lifetimes
-        let root = message_reader
-            .get_root::<crate::generated::metadata_capnp::directory_entry_metadata::Reader>()
-            .expect("Failed to get root reader");
-
-        assert_ne!(root.get_size(), 2);
+        assert_ne!(fb_data.size(), 2);
     }
 
     #[actix_web::test]
@@ -996,18 +1005,11 @@ mod tests {
 
         let body = test::read_body(resp).await;
 
-        let message_reader = serialize::read_message(body.as_ref(), Default::default())
-            .expect("Failed to parse Cap'n Proto message");
-
-        // Return both reader and root to maintain proper lifetimes
-        let root = message_reader
-            .get_root::<crate::generated::metadata_capnp::directory_entries_metadata::Reader>()
-            .expect("Failed to get root reader");
-
-        let entries = root.get_name().unwrap();
+        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+        let entries = fb_data.files().unwrap().name().unwrap();
 
         for name in file_names {
-            assert!(entries.iter().any(|e| e.unwrap() == name));
+            assert!(entries.iter().any(|e| e == name));
         }
     }
 

@@ -11,16 +11,13 @@ stats = ["logging"]
 [dependencies]
 actix-files = "0.6.6"
 actix-web = "4.9.0"
-capnp = "0.20.3"
 env_logger = { version = "0.11.6", optional = true }
+flatbuffers = "25.2.10"
 log = { version = "0.4.25", optional = true }
 scc = "2.3.0"
 serde = { version = "1.0.217", features = ["derive"] }
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["fs"] }
-
-[build-dependencies]
-capnpc = "0.20.1"
 
 [dev-dependencies]
 tempfile = "3.3.0"
