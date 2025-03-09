@@ -463,7 +463,6 @@ async fn main() -> std::io::Result<()> {
             .service(actix_web::web::resource("/healthcheck").route(
                 actix_web::web::get().to(|| async { actix_web::HttpResponse::Ok().body("OK") }),
             ))
-            .service(actix_files::Files::new("/repo", &path))
     })
     .bind(("0.0.0.0", port))?
     .run()
