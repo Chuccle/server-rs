@@ -107,21 +107,30 @@ fn create_buffer_serialized(metadata: &std::fs::Metadata, name: &str) -> Result<
 
     let name_fb = builder.create_string(name);
 
-    let modified_secs = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
+    let created_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+        metadata
+            .created()
+            .unwrap_or_else(|_| std::time::SystemTime::now()),
+    );
 
-    let accessed_secs = metadata
-        .accessed()?
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
+    let modified_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+        metadata
+            .modified()
+            .unwrap_or_else(|_| std::time::SystemTime::now()),
+    );
+
+    let accessed_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+        metadata
+            .accessed()
+            .unwrap_or_else(|_| std::time::SystemTime::now()),
+    );
 
     let entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
         &mut builder,
         &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
             name: Some(name_fb),
             size: metadata.len(),
+            created: created_secs,
             modified: modified_secs,
             accessed: accessed_secs,
         },
@@ -949,7 +958,7 @@ mod tests {
         let fb_data: DirectoryEntryMetadata =
             flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
 
-        assert_ne!(fb_data.size(), 2);
+        assert_eq!(fb_data.size(), 7);
     }
 
     #[actix_web::test]
@@ -1066,5 +1075,74 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         let body = test::read_body(resp).await;
         assert_eq!(body, "Path traversal attempt detected");
+    }
+
+    #[actix_web::test]
+    async fn test_file_and_data_changes() {
+        let (temp_dir, state) = setup_test_env().await;
+        let file_path = temp_dir.join("modifiable.txt");
+        File::create(&file_path).unwrap().write_all(b"v1").unwrap();
+
+        // obtain file metadata like creation time
+        let metadata = fs::metadata(&file_path).unwrap();
+
+        let created_secs =
+            crate::utils::windows::time::IntoFileTime::into_file_time(metadata.created().unwrap());
+
+        let modified_secs =
+            crate::utils::windows::time::IntoFileTime::into_file_time(metadata.modified().unwrap());
+
+        let accessed_secs =
+            crate::utils::windows::time::IntoFileTime::into_file_time(metadata.accessed().unwrap());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        // Initial request to populate cache
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=modifiable.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        let body = test::read_body(resp).await;
+
+        let fb_data: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+
+        assert_eq!(fb_data.name(), "modifiable.txt");
+        assert_eq!(fb_data.size(), metadata.len());
+        assert_eq!(fb_data.created(), created_secs);
+        assert_eq!(fb_data.modified(), modified_secs);
+        assert_eq!(fb_data.accessed(), accessed_secs);
+
+        // Modify the file
+        File::create(&file_path)
+            .unwrap()
+            .write_all(b"updated")
+            .unwrap();
+
+        // Fast-forward time beyond TTL
+        if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
+            let bar = foo.get_mut();
+            bar.1 = 0; // Set timestamp to epoch to simulate expiration
+        }
+        // Subsequent request should fetch fresh data
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=modifiable.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        let body = test::read_body(resp).await;
+
+        let fb_data: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+
+        assert_eq!(fb_data.name(), "modifiable.txt");
+        assert_eq!(fb_data.size(), 7);
+        assert_eq!(fb_data.created(), created_secs);
     }
 }

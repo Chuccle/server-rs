@@ -4,6 +4,7 @@ pub mod metadata {
     pub struct DirEntMetaEntries {
         names: Vec<String>,
         sizes: Vec<u64>,
+        created_times: Vec<u64>,
         modified_times: Vec<u64>,
         access_times: Vec<u64>,
     }
@@ -12,6 +13,7 @@ pub mod metadata {
             Self {
                 names: Vec::new(),
                 sizes: Vec::new(),
+                created_times: Vec::new(),
                 modified_times: Vec::new(),
                 access_times: Vec::new(),
             }
@@ -43,6 +45,13 @@ pub mod metadata {
             self.file_map.insert(name.to_owned(), idx);
             self.files.names.push(name.to_owned());
             self.files.sizes.push(metadata.len());
+            self.files.created_times.push(
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .created()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+            );
             self.files.modified_times.push(
                 crate::utils::windows::time::IntoFileTime::into_file_time(
                     metadata
@@ -64,6 +73,13 @@ pub mod metadata {
             self.sub_dir_map.insert(name.to_owned(), idx);
             self.sub_dirs.names.push(name.to_owned());
             self.sub_dirs.sizes.push(metadata.len());
+            self.files.created_times.push(
+                crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .created()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+            );
             self.sub_dirs.modified_times.push(
                 crate::utils::windows::time::IntoFileTime::into_file_time(
                     metadata
@@ -95,6 +111,7 @@ pub mod metadata {
 
             let names_vector = builder.create_vector(&names);
             let sizes_vector = builder.create_vector(&entries.sizes);
+            let created_vector = builder.create_vector(&entries.created_times);
             let modified_vector = builder.create_vector(&entries.modified_times);
             let accessed_vector = builder.create_vector(&entries.access_times);
 
@@ -103,6 +120,7 @@ pub mod metadata {
                 &crate::generated::blorg_meta_flat::DirectoryEntriesMetadataArgs {
                     name: Some(names_vector),
                     size: Some(sizes_vector),
+                    created: Some(created_vector),
                     modified: Some(modified_vector),
                     accessed: Some(accessed_vector),
                 },
@@ -146,6 +164,7 @@ pub mod metadata {
                 &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
                     name: Some(file_name),
                     size: self.files.sizes[idx],
+                    created: self.files.created_times[idx],
                     modified: self.files.modified_times[idx],
                     accessed: self.files.access_times[idx],
                 },
