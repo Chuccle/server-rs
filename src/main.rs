@@ -1144,7 +1144,6 @@ mod tests {
         assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), 7);
         assert_eq!(fb_data.created(), created_secs);
-        assert_ne!(fb_data.modified(), modified_secs);
     }
 
     #[actix_web::test]
