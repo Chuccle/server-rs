@@ -1144,5 +1144,277 @@ mod tests {
         assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), 7);
         assert_eq!(fb_data.created(), created_secs);
+        assert_ne!(fb_data.modified(), modified_secs);
+    }
+
+    #[actix_web::test]
+    async fn test_directory_metadata_fields() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        // Create nested directory structure with specific timestamps if possible
+        let nested_dir = _temp_dir.join("nested_test_dir");
+        fs::create_dir(&nested_dir).unwrap();
+
+        // Add a subdirectory to test with
+        let sub_dir = nested_dir.join("sub_directory");
+        fs::create_dir(&sub_dir).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=nested_test_dir")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let body = test::read_body(resp).await;
+
+        // Parse FlatBuffer data
+        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+
+        // Verify there's one directory and no files
+        assert_eq!(fb_data.directory_count(), 1);
+        assert_eq!(fb_data.file_count(), 0);
+
+        // Verify directory name
+        assert_eq!(
+            fb_data.directories().unwrap().name().unwrap().get(0),
+            "sub_directory"
+        );
+
+        // Check that metadata arrays all have the same length
+        assert_eq!(fb_data.directories().unwrap().name().unwrap().len(), 1);
+        assert_eq!(fb_data.directories().unwrap().size().unwrap().len(), 1);
+        assert_eq!(fb_data.directories().unwrap().created().unwrap().len(), 1);
+        assert_eq!(fb_data.directories().unwrap().modified().unwrap().len(), 1);
+        assert_eq!(fb_data.directories().unwrap().accessed().unwrap().len(), 1);
+
+        // Check that times are in the expected range (non-zero and recent)
+        let created = fb_data.directories().unwrap().created().unwrap().get(0);
+        let modified = fb_data.directories().unwrap().modified().unwrap().get(0);
+        let accessed = fb_data.directories().unwrap().accessed().unwrap().get(0);
+
+        assert!(created > 0);
+        assert!(modified > 0);
+        assert!(accessed > 0);
+    }
+
+    #[actix_web::test]
+    async fn test_directory_with_mixed_contents() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        // Create directory with multiple subdirectories and files
+        let mixed_dir = _temp_dir.join("mixed_dir");
+        fs::create_dir(&mixed_dir).unwrap();
+
+        // Create subdirectories
+        for i in 1..=3 {
+            fs::create_dir(mixed_dir.join(format!("subdir_{}", i))).unwrap();
+        }
+
+        // Create files
+        for i in 1..=5 {
+            File::create(mixed_dir.join(format!("file_{}.txt", i)))
+                .unwrap()
+                .write_all(format!("content {}", i).as_bytes())
+                .unwrap();
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=mixed_dir")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let body = test::read_body(resp).await;
+
+        // Parse FlatBuffer data
+        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+
+        // Verify counts
+        assert_eq!(fb_data.directory_count(), 3);
+        assert_eq!(fb_data.file_count(), 5);
+
+        // Verify all directory info arrays have the same length
+        let dir_names = fb_data.directories().unwrap().name().unwrap();
+        assert_eq!(dir_names.len(), 3);
+        assert_eq!(fb_data.directories().unwrap().size().unwrap().len(), 3);
+        assert_eq!(fb_data.directories().unwrap().created().unwrap().len(), 3);
+        assert_eq!(fb_data.directories().unwrap().modified().unwrap().len(), 3);
+        assert_eq!(fb_data.directories().unwrap().accessed().unwrap().len(), 3);
+
+        // Verify all file info arrays have the same length
+        let file_names = fb_data.files().unwrap().name().unwrap();
+        assert_eq!(file_names.len(), 5);
+        assert_eq!(fb_data.files().unwrap().size().unwrap().len(), 5);
+        assert_eq!(fb_data.files().unwrap().created().unwrap().len(), 5);
+        assert_eq!(fb_data.files().unwrap().modified().unwrap().len(), 5);
+        assert_eq!(fb_data.files().unwrap().accessed().unwrap().len(), 5);
+
+        // Verify directory names are present
+        let dir_names_set: std::collections::HashSet<&str> = dir_names.iter().collect();
+        assert!(dir_names_set.contains("subdir_1"));
+        assert!(dir_names_set.contains("subdir_2"));
+        assert!(dir_names_set.contains("subdir_3"));
+
+        // Verify file names are present
+        let file_names_set: std::collections::HashSet<&str> = file_names.iter().collect();
+        assert!(file_names_set.contains("file_1.txt"));
+        assert!(file_names_set.contains("file_2.txt"));
+        assert!(file_names_set.contains("file_3.txt"));
+        assert!(file_names_set.contains("file_4.txt"));
+        assert!(file_names_set.contains("file_5.txt"));
+    }
+
+    #[actix_web::test]
+    async fn test_timestamps_consistency() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        // Create a directory with one subdirectory
+        let parent_dir = _temp_dir.join("timestamp_test");
+        fs::create_dir(&parent_dir).unwrap();
+
+        let sub_dir = parent_dir.join("subdirectory");
+        fs::create_dir(&sub_dir).unwrap();
+
+        // Add a file to parent directory for comparison
+        let file_path = parent_dir.join("test_file.txt");
+        File::create(&file_path)
+            .unwrap()
+            .write_all(b"test")
+            .unwrap();
+
+        // Get original metadata
+        let subdir_meta = fs::metadata(&sub_dir).unwrap();
+        let file_meta = fs::metadata(&file_path).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/get_dir_info").to(get_dir_info_handler))
+                .service(web::resource("/get_file_info").to(get_file_info_handler)),
+        )
+        .await;
+
+        // Test directory listing
+        let req = test::TestRequest::get()
+            .uri("/get_dir_info?directory=timestamp_test")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let fb_dir: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+
+        // Test file info
+        let req = test::TestRequest::get()
+            .uri("/get_file_info?file_path=timestamp_test/test_file.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let fb_file: DirectoryEntryMetadata =
+            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+
+        // Verify file timestamps from get_file_info
+        let file_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            file_meta
+                .created()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+        let file_modified_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            file_meta
+                .modified()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+        let file_accessed_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            file_meta
+                .accessed()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+
+        assert_eq!(fb_file.created(), file_created_expected);
+        assert_eq!(fb_file.modified(), file_modified_expected);
+        assert_eq!(fb_file.accessed(), file_accessed_expected);
+
+        // Find file in directory listing
+        let file_names = fb_dir.files().unwrap().name().unwrap();
+        let file_index = file_names
+            .iter()
+            .position(|n| n == "test_file.txt")
+            .unwrap();
+
+        // Verify file timestamps from directory listing
+        assert_eq!(
+            fb_dir.files().unwrap().created().unwrap().get(file_index),
+            file_created_expected
+        );
+        assert_eq!(
+            fb_dir.files().unwrap().modified().unwrap().get(file_index),
+            file_modified_expected
+        );
+        assert_eq!(
+            fb_dir.files().unwrap().accessed().unwrap().get(file_index),
+            file_accessed_expected
+        );
+
+        // Verify subdirectory timestamps
+        let subdir_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            subdir_meta
+                .created()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+        let subdir_modified_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            subdir_meta
+                .modified()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+        let subdir_accessed_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
+            subdir_meta
+                .accessed()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
+
+        let dir_names = fb_dir.directories().unwrap().name().unwrap();
+        let dir_index = dir_names.iter().position(|n| n == "subdirectory").unwrap();
+
+        assert_eq!(
+            fb_dir
+                .directories()
+                .unwrap()
+                .created()
+                .unwrap()
+                .get(dir_index),
+            subdir_created_expected
+        );
+        assert_eq!(
+            fb_dir
+                .directories()
+                .unwrap()
+                .modified()
+                .unwrap()
+                .get(dir_index),
+            subdir_modified_expected
+        );
+        assert_eq!(
+            fb_dir
+                .directories()
+                .unwrap()
+                .accessed()
+                .unwrap()
+                .get(dir_index),
+            subdir_accessed_expected
+        );
     }
 }

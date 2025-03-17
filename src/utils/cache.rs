@@ -73,7 +73,7 @@ pub mod metadata {
             self.sub_dir_map.insert(name.to_owned(), idx);
             self.sub_dirs.names.push(name.to_owned());
             self.sub_dirs.sizes.push(metadata.len());
-            self.files.created_times.push(
+            self.sub_dirs.created_times.push(
                 crate::utils::windows::time::IntoFileTime::into_file_time(
                     metadata
                         .created()
@@ -90,7 +90,7 @@ pub mod metadata {
             self.sub_dirs.access_times.push(
                 crate::utils::windows::time::IntoFileTime::into_file_time(
                     metadata
-                        .modified()
+                        .accessed()
                         .unwrap_or_else(|_| std::time::SystemTime::now()),
                 ),
             );
