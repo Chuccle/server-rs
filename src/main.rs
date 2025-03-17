@@ -23,7 +23,7 @@ enum AppError {
     #[error("Permission denied")]
     PermissionDenied,
     #[error("Internal server error")]
-    Internal(std::io::Error),
+    Internal,
     #[error("Invalid path format")]
     InvalidPath,
     #[error("System time error")]
@@ -31,7 +31,7 @@ enum AppError {
     #[error("Task execution failed")]
     TaskJoin(#[from] tokio::task::JoinError),
     #[error("Numerical conversion error")]
-    TryFromIntError(#[from] std::num::TryFromIntError),
+    TryFromInt(#[from] std::num::TryFromIntError),
 }
 
 impl From<std::io::Error> for AppError {
@@ -39,8 +39,24 @@ impl From<std::io::Error> for AppError {
         match error.kind() {
             std::io::ErrorKind::NotFound => AppError::NotFound,
             std::io::ErrorKind::PermissionDenied => AppError::PermissionDenied,
-            _ => AppError::Internal(error),
+            _ => AppError::Internal,
         }
+    }
+}
+
+impl
+    From<(
+        std::path::PathBuf,
+        (utils::cache::metadata::DirectoryLookupContext, u64),
+    )> for AppError
+{
+    fn from(
+        _: (
+            std::path::PathBuf,
+            (utils::cache::metadata::DirectoryLookupContext, u64),
+        ),
+    ) -> Self {
+        AppError::Internal
     }
 }
 
@@ -55,10 +71,9 @@ impl actix_web::ResponseError for AppError {
                 actix_web::HttpResponse::BadRequest().finish()
             }
             Self::NotFound => actix_web::HttpResponse::NotFound().finish(),
-            Self::Internal(_)
-            | Self::SystemTime(_)
-            | Self::TaskJoin(_)
-            | Self::TryFromIntError(_) => actix_web::HttpResponse::InternalServerError().finish(),
+            Self::Internal | Self::SystemTime(_) | Self::TaskJoin(_) | Self::TryFromInt(_) => {
+                actix_web::HttpResponse::InternalServerError().finish()
+            }
         }
     }
 }
@@ -234,16 +249,7 @@ async fn get_file_info_handler(
     }
 
     log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
-    let meta = tokio::fs::symlink_metadata(&normalized_requested)
-        .await
-        .map_err(|e| {
-            log_warn!(
-                "Metadata fetch failed for {:?}: {}",
-                &normalized_requested,
-                e
-            );
-            AppError::Internal(e)
-        })?;
+    let meta = tokio::fs::symlink_metadata(&normalized_requested).await?;
 
     let file_name = normalized_requested
         .file_name()
@@ -253,10 +259,7 @@ async fn get_file_info_handler(
 
     let file_entry = create_buffer_serialized(&meta, file_name).map_err(|e| {
         log_error_with_context!(e, "Failed to create directory entry for {}", file_name);
-        AppError::Internal(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to create directory entry",
-        ))
+        e
     })?;
 
     Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(file_entry)))
@@ -273,7 +276,7 @@ async fn create_meta_cache_entry(
             let mut cache_entry = utils::cache::metadata::DirectoryLookupContext::new();
             let dir = std::fs::read_dir(&path).map_err(|e| {
                 log_warn_with_context!(e, "Failed to read directory {:?}", &path);
-                AppError::Internal(e)
+                e
             })?;
 
             for entry_result in dir {
@@ -309,11 +312,7 @@ async fn create_meta_cache_entry(
             Ok(cache_entry)
         }
     })
-    .await
-    .map_err(|e| {
-        log_error!("Directory processing task failed: {}", e);
-        AppError::TaskJoin(e)
-    })?
+    .await?
 }
 
 async fn get_dir_info_handler(
@@ -362,12 +361,9 @@ async fn get_dir_info_handler(
 
     data.meta_cache
         .put(normalized_requested, (directory_entry.clone(), now))
-        .map_err(|_| {
-            log_warn!("Failed to insert entry into cache");
-            AppError::Internal(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Cache insertion failed",
-            ))
+        .map_err(|e| {
+            log_warn_with_context!(e, "Failed to insert entry into cache");
+            e
         })?;
 
     let dir_ents = directory_entry.get_all_entries_serialized();
@@ -392,12 +388,7 @@ async fn read_file_buffer_handler(
         return Err(AppError::PathTraversal);
     }
 
-    actix_files::NamedFile::open_async(&normalized_requested)
-        .await
-        .map_err(|e| {
-            log_warn!("Failed to open file {:?}: {}", &normalized_requested, e);
-            AppError::Internal(e)
-        })
+    Ok(actix_files::NamedFile::open_async(&normalized_requested).await?)
 }
 
 async fn find_file_handler(
@@ -913,6 +904,7 @@ mod tests {
     }
 
     #[actix_web::test]
+    #[cfg(unix)]
     async fn test_permission_denied() {
         let (temp_dir, state) = setup_test_env().await;
         let restricted_dir = temp_dir.join("restricted");
@@ -920,7 +912,6 @@ mod tests {
         let restricted_file = restricted_dir.join("no_access.txt");
         File::create(&restricted_file).unwrap();
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
@@ -937,9 +928,8 @@ mod tests {
             .uri("/get_dir_info?directory=restricted")
             .to_request();
         let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
 
-        #[cfg(unix)]
         fs::set_permissions(
             restricted_dir,
             <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
