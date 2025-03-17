@@ -20,8 +20,10 @@ enum AppError {
     InvalidPathEncoding,
     #[error("Resource not found")]
     NotFound,
+    #[error("Permission denied")]
+    PermissionDenied,
     #[error("Internal server error")]
-    Internal(#[from] std::io::Error),
+    Internal(std::io::Error),
     #[error("Invalid path format")]
     InvalidPath,
     #[error("System time error")]
@@ -32,21 +34,31 @@ enum AppError {
     TryFromIntError(#[from] std::num::TryFromIntError),
 }
 
+impl From<std::io::Error> for AppError {
+    fn from(error: std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => AppError::NotFound,
+            std::io::ErrorKind::PermissionDenied => AppError::PermissionDenied,
+            _ => AppError::Internal(error),
+        }
+    }
+}
+
 impl actix_web::ResponseError for AppError {
     fn error_response(&self) -> actix_web::HttpResponse {
         log_error!("API error: {}", self);
         match self {
-            Self::PathTraversal => actix_web::HttpResponse::Forbidden().body(self.to_string()),
-            Self::InvalidPathEncoding | Self::InvalidPath => {
-                actix_web::HttpResponse::BadRequest().body(self.to_string())
+            Self::PermissionDenied | Self::PathTraversal => {
+                actix_web::HttpResponse::Forbidden().finish()
             }
-            Self::NotFound => actix_web::HttpResponse::NotFound().body(self.to_string()),
+            Self::InvalidPathEncoding | Self::InvalidPath => {
+                actix_web::HttpResponse::BadRequest().finish()
+            }
+            Self::NotFound => actix_web::HttpResponse::NotFound().finish(),
             Self::Internal(_)
             | Self::SystemTime(_)
             | Self::TaskJoin(_)
-            | Self::TryFromIntError(_) => {
-                actix_web::HttpResponse::InternalServerError().body("Internal server error")
-            }
+            | Self::TryFromIntError(_) => actix_web::HttpResponse::InternalServerError().finish(),
         }
     }
 }
@@ -388,6 +400,27 @@ async fn read_file_buffer_handler(
         })
 }
 
+async fn find_file_handler(
+    data: actix_web::web::Data<AppState>,
+    params: actix_web::web::Query<FileRequest>,
+) -> Result<actix_web::HttpResponse, AppError> {
+    log_info!("[FIND FILE] Handling request for: {}", &params.file_path);
+
+    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
+    log_debug!(
+        "Checking file from validated path: {:?}",
+        &normalized_requested
+    );
+
+    let canonicalized_path = tokio::fs::canonicalize(&normalized_requested).await?;
+
+    if !canonicalized_path.starts_with(&data.base_path) {
+        return Err(AppError::PathTraversal);
+    }
+
+    Ok(actix_web::HttpResponse::Found().finish())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     #[cfg(feature = "logging")]
@@ -469,8 +502,12 @@ async fn main() -> std::io::Result<()> {
                 actix_web::web::resource("/get_file")
                     .route(actix_web::web::get().to(read_file_buffer_handler)),
             )
+            .service(
+                actix_web::web::resource("/find_file")
+                    .route(actix_web::web::get().to(find_file_handler)),
+            )
             .service(actix_web::web::resource("/healthcheck").route(
-                actix_web::web::get().to(|| async { actix_web::HttpResponse::Ok().body("OK") }),
+                actix_web::web::get().to(|| async { actix_web::HttpResponse::Ok().finish() }),
             ))
     })
     .bind(("0.0.0.0", port))?
@@ -1073,8 +1110,6 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "Path traversal attempt detected");
     }
 
     #[actix_web::test]
@@ -1415,5 +1450,62 @@ mod tests {
                 .get(dir_index),
             subdir_accessed_expected
         );
+    }
+
+    #[actix_web::test]
+    async fn test_existing() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/find_file").to(find_file_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=test_file.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_nonexistent() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/find_file").to(find_file_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=nonexistent.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_path_traversal() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/find_file").to(find_file_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=../passwd.txt")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
 }
