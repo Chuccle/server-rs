@@ -27,7 +27,6 @@ pub mod metadata {
         sub_dirs: DirEntMetaEntries,
         // Fast lookup
         file_map: std::collections::HashMap<String, usize>, // Maps filename -> index in files
-        sub_dir_map: std::collections::HashMap<String, usize>, // Maps sub_dir -> index in files
     }
 
     impl DirectoryLookupContext {
@@ -36,7 +35,6 @@ pub mod metadata {
                 files: DirEntMetaEntries::new(),
                 sub_dirs: DirEntMetaEntries::new(),
                 file_map: std::collections::HashMap::new(),
-                sub_dir_map: std::collections::HashMap::new(),
             }
         }
 
@@ -69,8 +67,6 @@ pub mod metadata {
         }
 
         pub fn add_subdir(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let idx = self.sub_dirs.names.len();
-            self.sub_dir_map.insert(name.to_owned(), idx);
             self.sub_dirs.names.push(name.to_owned());
             self.sub_dirs.sizes.push(metadata.len());
             self.sub_dirs.created_times.push(
