@@ -92,6 +92,11 @@ struct DirQuery {
 struct FileRequest {
     file_path: String,
 }
+#[derive(serde::Deserialize)]
+struct FindFile {
+    file_path: String,
+    is_directory: bool,
+}
 
 struct AppState {
     meta_cache:
@@ -393,7 +398,7 @@ async fn read_file_buffer_handler(
 
 async fn find_file_handler(
     data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<FileRequest>,
+    params: actix_web::web::Query<FindFile>,
 ) -> Result<actix_web::HttpResponse, AppError> {
     log_info!("[FIND FILE] Handling request for: {}", &params.file_path);
 
@@ -409,7 +414,10 @@ async fn find_file_handler(
         return Err(AppError::PathTraversal);
     }
 
-    Ok(actix_web::HttpResponse::Found().finish())
+    match (params.is_directory, canonicalized_path.is_dir()) {
+        (true, true) | (false, false) => Ok(actix_web::HttpResponse::Found().finish()),
+        _ => Ok(actix_web::HttpResponse::NotFound().finish()),
+    }
 }
 
 #[actix_web::main]
@@ -1443,7 +1451,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_existing() {
+    async fn test_find_file_existing() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
@@ -1454,7 +1462,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_file.txt")
+            .uri("/find_file?file_path=test_file.txt&is_directory=false")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1462,7 +1470,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_nonexistent() {
+    async fn test_find_file_filetype_validation() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
@@ -1473,7 +1481,47 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=nonexistent.txt")
+            .uri("/find_file?file_path=test_file.txt&is_directory=true")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=test_file.txt&is_directory=false")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::FOUND);
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=test_dir&is_directory=false")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=test_dir&is_directory=true")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_find_file_nonexistent() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(web::resource("/find_file").to(find_file_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/find_file?file_path=nonexistent.txt&is_directory=false")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1481,7 +1529,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_path_traversal() {
+    async fn test_find_file_path_traversal() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
@@ -1492,7 +1540,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=../passwd.txt")
+            .uri("/find_file?file_path=../passwd.txt&is_directory=false")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
