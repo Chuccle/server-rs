@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 mod generated {
-    #![allow(clippy::all, unused_imports, dead_code)]
+    #![allow(clippy::all, unused_imports, dead_code, unsafe_op_in_unsafe_fn)]
     include!(concat!(
         env!("OUT_DIR"),
         "/metadata_flatbuffer_generated.rs"
@@ -200,42 +200,47 @@ async fn get_file_info_handler(
     log_debug!("Checking cache for parent directory: {:?}", parent_dir);
     let cache_result = data.meta_cache.get_async(parent_dir).await;
 
-    if let Some(entry) = &cache_result {
-        let (cached_meta, timestamp) = entry.get();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+    match &cache_result {
+        Some(entry) => {
+            let (cached_meta, timestamp) = entry.get();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
 
-        log_trace!(
-            "Cache entry found - Timestamp: {}, Current: {}, TTL: {}",
-            timestamp,
-            now,
-            CACHE_TTL_SECONDS
-        );
+            log_trace!(
+                "Cache entry found - Timestamp: {}, Current: {}, TTL: {}",
+                timestamp,
+                now,
+                CACHE_TTL_SECONDS
+            );
 
-        if now - timestamp < CACHE_TTL_SECONDS {
-            data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", parent_dir);
+            if now - timestamp < CACHE_TTL_SECONDS {
+                data.cache_stats.increment_hits();
+                log_debug!("Cache hit for directory: {:?}", parent_dir);
 
-            let file_name = normalized_requested
-                .file_name()
-                .ok_or(AppError::InvalidPath)?
-                .to_str()
-                .ok_or(AppError::InvalidPathEncoding)?;
+                let file_name = normalized_requested
+                    .file_name()
+                    .ok_or(AppError::InvalidPath)?
+                    .to_str()
+                    .ok_or(AppError::InvalidPathEncoding)?;
 
-            log_trace!("Looking for file in cache: {}", file_name);
+                log_trace!("Looking for file in cache: {}", file_name);
 
-            if let Some(dir_ent) = cached_meta.get_file_serialized(file_name) {
-                log_debug!("File found in cache: {}", file_name);
-                return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ent)));
+                if let Some(dir_ent) = cached_meta.get_file_serialized(file_name) {
+                    log_debug!("File found in cache: {}", file_name);
+                    return Ok(
+                        actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ent))
+                    );
+                }
+            } else {
+                log_debug!("Cache entry expired for: {:?}", parent_dir);
+                data.cache_stats.increment_misses();
             }
-        } else {
-            log_debug!("Cache entry expired for: {:?}", parent_dir);
+        }
+        _ => {
+            log_debug!("Cache miss for directory: {:?}", parent_dir);
             data.cache_stats.increment_misses();
         }
-    } else {
-        log_debug!("Cache miss for directory: {:?}", parent_dir);
-        data.cache_stats.increment_misses();
     }
 
     log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
@@ -252,7 +257,9 @@ async fn get_file_info_handler(
         e
     })?;
 
-    Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(file_entry)))
+    let mut resp = actix_web::HttpResponse::Ok();
+
+    Ok(resp.body(actix_web::web::Bytes::from(file_entry)))
 }
 
 async fn create_meta_cache_entry(
@@ -530,7 +537,7 @@ fn start_cache_statistics_logger(state: actix_web::web::Data<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{http, test, web, App};
+    use actix_web::{App, http, test, web};
     use generated::blorg_meta_flat::{Directory, DirectoryEntryMetadata};
     use std::fs::{self, File};
     use std::io::Write;
