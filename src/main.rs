@@ -79,23 +79,8 @@ impl actix_web::ResponseError for AppError {
 }
 
 #[derive(serde::Deserialize)]
-struct FileQuery {
-    file_path: String,
-}
-
-#[derive(serde::Deserialize)]
-struct DirQuery {
-    directory: String,
-}
-
-#[derive(serde::Deserialize)]
-struct FileRequest {
-    file_path: String,
-}
-#[derive(serde::Deserialize)]
-struct FindFile {
-    file_path: String,
-    is_directory: bool,
+struct PathQuery {
+    path: String,
 }
 
 struct AppState {
@@ -195,11 +180,11 @@ fn validate_path(
 
 async fn get_file_info_handler(
     data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<FileQuery>,
+    params: actix_web::web::Query<PathQuery>,
 ) -> Result<actix_web::HttpResponse, AppError> {
-    log_info!("[FILE INFO] Handling request for: {}", &params.file_path);
+    log_info!("[FILE INFO] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
+    let normalized_requested = validate_path(&data.base_path, &params.path)?;
     log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
     if !normalized_requested.is_file() {
@@ -322,11 +307,11 @@ async fn create_meta_cache_entry(
 
 async fn get_dir_info_handler(
     data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<DirQuery>,
+    params: actix_web::web::Query<PathQuery>,
 ) -> Result<actix_web::HttpResponse, AppError> {
-    log_info!("[DIR INFO] Handling request for: {}", &params.directory);
+    log_info!("[DIR INFO] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.directory)?;
+    let normalized_requested = validate_path(&data.base_path, &params.path)?;
     log_trace!("Validated canonical path: {:?}", &normalized_requested);
 
     if !normalized_requested.is_dir() {
@@ -377,11 +362,11 @@ async fn get_dir_info_handler(
 
 async fn read_file_buffer_handler(
     data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<FileRequest>,
+    params: actix_web::web::Query<PathQuery>,
 ) -> Result<actix_files::NamedFile, AppError> {
-    log_info!("[FILE READ] Handling request for: {}", &params.file_path);
+    log_info!("[FILE READ] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
+    let normalized_requested = validate_path(&data.base_path, &params.path)?;
     log_debug!(
         "Serving file from validated path: {:?}",
         &normalized_requested
@@ -396,13 +381,13 @@ async fn read_file_buffer_handler(
     Ok(actix_files::NamedFile::open_async(&normalized_requested).await?)
 }
 
-async fn find_file_handler(
+async fn find_path_handler(
     data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<FindFile>,
+    params: actix_web::web::Query<PathQuery>,
 ) -> Result<actix_web::HttpResponse, AppError> {
-    log_info!("[FIND FILE] Handling request for: {}", &params.file_path);
+    log_info!("[FIND PATH] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.file_path)?;
+    let normalized_requested = validate_path(&data.base_path, &params.path)?;
     log_debug!(
         "Checking file from validated path: {:?}",
         &normalized_requested
@@ -414,9 +399,9 @@ async fn find_file_handler(
         return Err(AppError::PathTraversal);
     }
 
-    match (params.is_directory, canonicalized_path.is_dir()) {
-        (true, true) | (false, false) => Ok(actix_web::HttpResponse::Found().finish()),
-        _ => Ok(actix_web::HttpResponse::NotFound().finish()),
+    match canonicalized_path.is_dir() {
+        true => Ok(actix_web::HttpResponse::Found().body("1")),
+        false => Ok(actix_web::HttpResponse::Found().body("0")),
     }
 }
 
@@ -502,8 +487,8 @@ async fn main() -> std::io::Result<()> {
                     .route(actix_web::web::get().to(read_file_buffer_handler)),
             )
             .service(
-                actix_web::web::resource("/find_file")
-                    .route(actix_web::web::get().to(find_file_handler)),
+                actix_web::web::resource("/find_path")
+                    .route(actix_web::web::get().to(find_path_handler)),
             )
             .service(actix_web::web::resource("/healthcheck").route(
                 actix_web::web::get().to(|| async { actix_web::HttpResponse::Ok().finish() }),
@@ -586,7 +571,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=test_file.txt")
+            .uri("/get_file_info?path=test_file.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -614,7 +599,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=nonexistent.txt")
+            .uri("/get_file_info?path=nonexistent.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -633,7 +618,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=test_dir")
+            .uri("/get_dir_info?path=test_dir")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -675,7 +660,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_file?file_path=test_file.txt")
+            .uri("/get_file?path=test_file.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -697,7 +682,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=../passwd.txt")
+                .uri("/get_file_info?path=../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -706,7 +691,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=/../passwd.txt")
+                .uri("/get_file_info?path=/../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -715,7 +700,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir/../../passwd.txt")
+                .uri("/get_file_info?path=test_dir/../../passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -724,7 +709,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir/../")
+                .uri("/get_file_info?path=test_dir/../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -733,7 +718,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=./test_dir/../")
+                .uri("/get_file_info?path=./test_dir/../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -742,7 +727,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir/./../")
+                .uri("/get_file_info?path=test_dir/./../")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -763,7 +748,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=..\\passwd.txt")
+                .uri("/get_file_info?path=..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -772,7 +757,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=\\..\\passwd.txt")
+                .uri("/get_file_info?path=\\..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -781,7 +766,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir\\..\\..\\passwd.txt")
+                .uri("/get_file_info?path=test_dir\\..\\..\\passwd.txt")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -790,7 +775,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir\\..\\")
+                .uri("/get_file_info?path=test_dir\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -799,7 +784,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=.\\test_dir\\..\\")
+                .uri("/get_file_info?path=.\\test_dir\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -808,7 +793,7 @@ mod tests {
 
         {
             let req = test::TestRequest::get()
-                .uri("/get_file_info?file_path=test_dir\\.\\..\\")
+                .uri("/get_file_info?path=test_dir\\.\\..\\")
                 .to_request();
             let resp = test::call_service(&app, req).await;
 
@@ -830,7 +815,7 @@ mod tests {
 
         // First request (cache miss)
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=test_dir")
+            .uri("/get_dir_info?path=test_dir")
             .to_request();
         let _ = test::call_service(&app, req).await;
         assert_eq!(state.cache_stats.get().0, 0);
@@ -838,7 +823,7 @@ mod tests {
 
         // Second request (cache hit)
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=test_dir")
+            .uri("/get_dir_info?path=test_dir")
             .to_request();
         let _ = test::call_service(&app, req).await;
         assert_eq!(state.cache_stats.get().0, 1);
@@ -878,7 +863,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=test_dir")
+            .uri("/get_dir_info?path=test_dir")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -905,7 +890,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-        .uri("/get_file_info?file_path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
+        .uri("/get_file_info?path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
         .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -933,7 +918,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=restricted")
+            .uri("/get_dir_info?path=restricted")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
@@ -960,7 +945,7 @@ mod tests {
 
         // Initial request to populate cache
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=modifiable.txt")
+            .uri("/get_file_info?path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -984,7 +969,7 @@ mod tests {
         }
         // Subsequent request should fetch fresh data
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=modifiable.txt")
+            .uri("/get_file_info?path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1011,7 +996,7 @@ mod tests {
 
         for _ in 0..100000 {
             let req = test::TestRequest::get()
-                .uri("/get_dir_info?directory=test_dir")
+                .uri("/get_dir_info?path=test_dir")
                 .to_request();
             results.push(test::call_service(&service, req).await.status());
         }
@@ -1042,7 +1027,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=.")
+            .uri("/get_dir_info?path=.")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1095,7 +1080,7 @@ mod tests {
 
         // Test valid symlink
         let req = test::TestRequest::get()
-            .uri("/get_file?file_path=valid_link.txt")
+            .uri("/get_file?path=valid_link.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -1104,7 +1089,7 @@ mod tests {
 
         // Test malicious symlink
         let req = test::TestRequest::get()
-            .uri("/get_file?file_path=malicious_link.txt")
+            .uri("/get_file?path=malicious_link.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
@@ -1137,7 +1122,7 @@ mod tests {
 
         // Initial request to populate cache
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=modifiable.txt")
+            .uri("/get_file_info?path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1165,7 +1150,7 @@ mod tests {
         }
         // Subsequent request should fetch fresh data
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=modifiable.txt")
+            .uri("/get_file_info?path=modifiable.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1199,7 +1184,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=nested_test_dir")
+            .uri("/get_dir_info?path=nested_test_dir")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1266,7 +1251,7 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=mixed_dir")
+            .uri("/get_dir_info?path=mixed_dir")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1344,7 +1329,7 @@ mod tests {
 
         // Test directory listing
         let req = test::TestRequest::get()
-            .uri("/get_dir_info?directory=timestamp_test")
+            .uri("/get_dir_info?path=timestamp_test")
             .to_request();
         let resp = test::call_service(&app, req).await;
         let body = test::read_body(resp).await;
@@ -1352,7 +1337,7 @@ mod tests {
 
         // Test file info
         let req = test::TestRequest::get()
-            .uri("/get_file_info?file_path=timestamp_test/test_file.txt")
+            .uri("/get_file_info?path=timestamp_test/test_file.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
         let body = test::read_body(resp).await;
@@ -1451,18 +1436,18 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_find_file_existing() {
+    async fn test_find_path_existing() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/find_file").to(find_file_handler)),
+                .service(web::resource("/find_path").to(find_path_handler)),
         )
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_file.txt&is_directory=false")
+            .uri("/find_path?path=test_file.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1470,58 +1455,46 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_find_file_filetype_validation() {
+    async fn test_find_path_filetype_validation() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/find_file").to(find_file_handler)),
+                .service(web::resource("/find_path").to(find_path_handler)),
         )
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_file.txt&is_directory=true")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-
-        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
-
-        let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_file.txt&is_directory=false")
+            .uri("/find_path?path=test_file.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), http::StatusCode::FOUND);
+        assert_eq!(test::read_body(resp).await[0], b'0');
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_dir&is_directory=false")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-
-        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
-
-        let req = test::TestRequest::get()
-            .uri("/find_file?file_path=test_dir&is_directory=true")
+            .uri("/find_path?path=test_dir")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), http::StatusCode::FOUND);
+        assert_eq!(test::read_body(resp).await[0], b'1');
     }
 
     #[actix_web::test]
-    async fn test_find_file_nonexistent() {
+    async fn test_find_path_nonexistent() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/find_file").to(find_file_handler)),
+                .service(web::resource("/find_path").to(find_path_handler)),
         )
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=nonexistent.txt&is_directory=false")
+            .uri("/find_path?path=nonexistent.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
@@ -1529,18 +1502,18 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_find_file_path_traversal() {
+    async fn test_find_path_path_traversal() {
         let (_temp_dir, state) = setup_test_env().await;
 
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .service(web::resource("/find_file").to(find_file_handler)),
+                .service(web::resource("/find_path").to(find_path_handler)),
         )
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/find_file?file_path=../passwd.txt&is_directory=false")
+            .uri("/find_path?path=../passwd.txt")
             .to_request();
         let resp = test::call_service(&app, req).await;
 
