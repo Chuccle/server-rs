@@ -1,6 +1,6 @@
 pub mod metadata {
 
-    #[derive(Debug, Clone, serde::Serialize)]
+    #[derive(Debug, Clone)]
     pub struct DirEntMetaEntries {
         names: Vec<String>,
         sizes: Vec<u64>,

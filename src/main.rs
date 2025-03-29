@@ -60,19 +60,19 @@ impl
     }
 }
 
-impl actix_web::ResponseError for AppError {
-    fn error_response(&self) -> actix_web::HttpResponse {
+impl axum::response::IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
         log_error!("API error: {}", self);
         match self {
             Self::PermissionDenied | Self::PathTraversal => {
-                actix_web::HttpResponse::Forbidden().finish()
+                axum::http::StatusCode::FORBIDDEN.into_response()
             }
             Self::InvalidPathEncoding | Self::InvalidPath => {
-                actix_web::HttpResponse::BadRequest().finish()
+                axum::http::StatusCode::BAD_REQUEST.into_response()
             }
-            Self::NotFound => actix_web::HttpResponse::NotFound().finish(),
+            Self::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
             Self::Internal | Self::SystemTime(_) | Self::TaskJoin(_) | Self::TryFromInt(_) => {
-                actix_web::HttpResponse::InternalServerError().finish()
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
     }
@@ -179,9 +179,9 @@ fn validate_path(
 }
 
 async fn get_file_info_handler(
-    data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<PathQuery>,
-) -> Result<actix_web::HttpResponse, AppError> {
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PathQuery>,
+) -> Result<Vec<u8>, AppError> {
     log_info!("[FILE INFO] Handling request for: {}", &params.path);
 
     let normalized_requested = validate_path(&data.base_path, &params.path)?;
@@ -228,21 +228,18 @@ async fn get_file_info_handler(
 
                 if let Some(dir_ent) = cached_meta.get_file_serialized(file_name) {
                     log_debug!("File found in cache: {}", file_name);
-                    return Ok(
-                        actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ent))
-                    );
+                    return Ok(dir_ent);
                 }
             } else {
                 log_debug!("Cache entry expired for: {:?}", parent_dir);
                 data.cache_stats.increment_misses();
             }
         }
-        _ => {
+        None => {
             log_debug!("Cache miss for directory: {:?}", parent_dir);
             data.cache_stats.increment_misses();
         }
     }
-
     log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
     let meta = tokio::fs::symlink_metadata(&normalized_requested).await?;
 
@@ -257,9 +254,7 @@ async fn get_file_info_handler(
         e
     })?;
 
-    let mut resp = actix_web::HttpResponse::Ok();
-
-    Ok(resp.body(actix_web::web::Bytes::from(file_entry)))
+    Ok(file_entry)
 }
 
 async fn create_meta_cache_entry(
@@ -313,9 +308,9 @@ async fn create_meta_cache_entry(
 }
 
 async fn get_dir_info_handler(
-    data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<PathQuery>,
-) -> Result<actix_web::HttpResponse, AppError> {
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PathQuery>,
+) -> Result<Vec<u8>, AppError> {
     log_info!("[DIR INFO] Handling request for: {}", &params.path);
 
     let normalized_requested = validate_path(&data.base_path, &params.path)?;
@@ -336,16 +331,14 @@ async fn get_dir_info_handler(
         if now - timestamp < CACHE_TTL_SECONDS {
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", &normalized_requested);
-            let dir_ents = cached_dir_meta.get_all_entries_serialized();
-            return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
+            return Ok(cached_dir_meta.get_all_entries_serialized());
         }
 
         log_debug!("Expired cache entry: {:?}", &normalized_requested);
         data.cache_stats.increment_misses();
         let directory_entry = &create_meta_cache_entry(cache_entry.key().to_owned()).await?;
         cache_entry.put((directory_entry.clone(), now));
-        let dir_ents = directory_entry.get_all_entries_serialized();
-        return Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)));
+        return Ok(directory_entry.get_all_entries_serialized());
     }
 
     data.cache_stats.increment_misses();
@@ -363,14 +356,13 @@ async fn get_dir_info_handler(
             e
         })?;
 
-    let dir_ents = directory_entry.get_all_entries_serialized();
-    Ok(actix_web::HttpResponse::Ok().body(actix_web::web::Bytes::from(dir_ents)))
+    Ok(directory_entry.get_all_entries_serialized())
 }
 
 async fn read_file_buffer_handler(
-    data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<PathQuery>,
-) -> Result<actix_files::NamedFile, AppError> {
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PathQuery>,
+) -> Result<Vec<u8>, AppError> {
     log_info!("[FILE READ] Handling request for: {}", &params.path);
 
     let normalized_requested = validate_path(&data.base_path, &params.path)?;
@@ -385,13 +377,13 @@ async fn read_file_buffer_handler(
         return Err(AppError::PathTraversal);
     }
 
-    Ok(actix_files::NamedFile::open_async(&normalized_requested).await?)
+    Ok(tokio::fs::read(&normalized_requested).await?)
 }
 
 async fn find_path_handler(
-    data: actix_web::web::Data<AppState>,
-    params: actix_web::web::Query<PathQuery>,
-) -> Result<actix_web::HttpResponse, AppError> {
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PathQuery>,
+) -> Result<(axum::http::StatusCode, &'static str), AppError> {
     log_info!("[FIND PATH] Handling request for: {}", &params.path);
 
     let normalized_requested = validate_path(&data.base_path, &params.path)?;
@@ -406,13 +398,14 @@ async fn find_path_handler(
         return Err(AppError::PathTraversal);
     }
 
+    // Return "1" for directory, "0" for file
     match canonicalized_path.is_dir() {
-        true => Ok(actix_web::HttpResponse::Found().body("1")),
-        false => Ok(actix_web::HttpResponse::Found().body("0")),
+        true => Ok((axum::http::StatusCode::FOUND, "1")),
+        false => Ok((axum::http::StatusCode::FOUND, "0")),
     }
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     #[cfg(feature = "logging")]
     utils::logging::init();
@@ -467,50 +460,39 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap_or(8080);
 
-    let state = actix_web::web::Data::new(AppState {
+    let state = std::sync::Arc::new(AppState {
         meta_cache: scc::HashCache::with_capacity(1000, 20000),
         base_path: path.clone(),
         cache_stats: utils::stats::Cache::new(),
     });
 
     #[cfg(feature = "stats")]
-    start_cache_statistics_logger(state.clone());
+    start_cache_statistics_logger(axum::extract::State(state.clone()));
 
+    let app = axum::Router::new()
+        .route("/get_file_info", axum::routing::get(get_file_info_handler))
+        .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+        .route("/get_file", axum::routing::get(read_file_buffer_handler))
+        .route("/find_path", axum::routing::get(find_path_handler))
+        .route(
+            "/healthcheck",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .with_state(state);
+
+    // Start server
     log_info!("Starting server on port {} serving path: {:?}", port, &path);
-    actix_web::HttpServer::new(move || {
-        actix_web::App::new()
-            .wrap(actix_web::middleware::Logger::new("%a %{User-Agent}i").exclude("/healthcheck"))
-            .app_data(state.clone())
-            .service(
-                actix_web::web::resource("/get_file_info")
-                    .route(actix_web::web::get().to(get_file_info_handler)),
-            )
-            .service(
-                actix_web::web::resource("/get_dir_info")
-                    .route(actix_web::web::get().to(get_dir_info_handler)),
-            )
-            .service(
-                actix_web::web::resource("/get_file")
-                    .route(actix_web::web::get().to(read_file_buffer_handler)),
-            )
-            .service(
-                actix_web::web::resource("/find_path")
-                    .route(actix_web::web::get().to(find_path_handler)),
-            )
-            .service(actix_web::web::resource("/healthcheck").route(
-                actix_web::web::get().to(|| async { actix_web::HttpResponse::Ok().finish() }),
-            ))
-    })
-    .bind(("0.0.0.0", port))?
-    .run()
-    .await
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
 #[cfg(feature = "stats")]
-fn start_cache_statistics_logger(state: actix_web::web::Data<AppState>) {
+fn start_cache_statistics_logger(state: axum::extract::State<std::sync::Arc<AppState>>) {
     const STATS_LOG_INTERVAL_SECONDS: u64 = 30;
 
-    actix_web::rt::spawn(async move {
+    tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(STATS_LOG_INTERVAL_SECONDS));
         loop {
@@ -537,14 +519,21 @@ fn start_cache_statistics_logger(state: actix_web::web::Data<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{App, http, test, web};
+    use axum::{
+        Router,
+        body::Body,
+        http::{self, Request},
+    };
     use generated::blorg_meta_flat::{Directory, DirectoryEntryMetadata};
+    use http_body_util::BodyExt;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tower::{Service, util::ServiceExt};
 
     // Test setup helper
-    async fn setup_test_env() -> (PathBuf, web::Data<AppState>) {
+    async fn setup_test_env() -> (PathBuf, Arc<AppState>) {
         let base_dir = tempfile::tempdir().unwrap().into_path();
         // Create test files
         fs::create_dir(base_dir.join("test_dir")).unwrap();
@@ -557,7 +546,7 @@ mod tests {
             .write_all(b"nested content")
             .unwrap();
 
-        let state = web::Data::new(AppState {
+        let state = std::sync::Arc::new(AppState {
             meta_cache: scc::HashCache::with_capacity(1000, 20000),
             base_path: base_dir.clone(),
             cache_stats: utils::stats::Cache::new(),
@@ -566,75 +555,73 @@ mod tests {
         (base_dir, state)
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_valid_file_info() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=test_file.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
 
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::OK);
 
-        let body = test::read_body(resp).await;
-
+        let bytes = resp.collect().await.unwrap().to_bytes();
         // Parse FlatBuffer data
         let fb_data: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         assert_eq!(fb_data.name(), "test_file.txt");
         assert_eq!(fb_data.size(), 12);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_nonexistent_file_info() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=nonexistent.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_directory_info() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=test_dir")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::OK);
 
-        let body = test::read_body(resp).await;
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         // Parse FlatBuffer data
-        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+        let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
         let directory_count = fb_data.directory_count();
         let file_count = fb_data.file_count();
@@ -655,190 +642,297 @@ mod tests {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_file_download() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file").to(read_file_buffer_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_file", axum::routing::get(read_file_buffer_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file?path=test_file.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::OK);
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "test content");
+        let bytes = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes, "test content");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_path_traversal_protection_posix() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(read_file_buffer_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=../passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=/../passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=test_dir/../../passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=test_dir/../")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir/../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=./test_dir/../")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir/../../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=./test_dir/../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=test_dir/./../")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=./test_dir/../../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir/./../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir/./../../")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_path_traversal_protection_windows() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(read_file_buffer_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=..\\passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=\\..\\passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_file_info?path=test_dir\\..\\..\\passwd.txt")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=test_dir\\..\\")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=.\\test_dir\\..\\")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir\\..\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=.\\test_dir\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
         }
 
         {
-            let req = test::TestRequest::get()
-                .uri("/get_file_info?path=test_dir\\.\\..\\")
-                .to_request();
-            let resp = test::call_service(&app, req).await;
+            let req = Request::builder()
+                .uri("/get_dir_info?path=.\\test_dir\\..\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir\\.\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
 
             assert_eq!(resp.status(), http::StatusCode::OK);
+        }
+
+        {
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir\\.\\..\\..\\")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
         }
     }
 
     #[cfg(feature = "stats")]
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_cache_behavior() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state.clone());
 
         // First request (cache miss)
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=test_dir")
-            .to_request();
-        let _ = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let _ = app.call(req).await.unwrap();
         assert_eq!(state.cache_stats.get().0, 0);
         assert_eq!(state.cache_stats.get().1, 1);
 
         // Second request (cache hit)
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=test_dir")
-            .to_request();
-        let _ = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let _ = app.call(req).await.unwrap();
         assert_eq!(state.cache_stats.get().0, 1);
         assert_eq!(state.cache_stats.get().1, 1);
     }
 
     #[cfg(feature = "stats")]
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_cache_expiration() {
         let (_temp_dir, state) = setup_test_env().await;
 
@@ -862,24 +956,24 @@ mod tests {
             )
             .unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state.clone());
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=test_dir")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::OK);
         // Verify cache was updated
         assert_eq!(state.cache_stats.get().1, 1); // Should count as miss
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_deep_nested_directories() {
         let (temp_dir, state) = setup_test_env().await;
         let mut path = temp_dir.clone();
@@ -889,21 +983,22 @@ mod tests {
         }
         File::create(path.join("deep_file.txt")).unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
-        .uri("/get_file_info?path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
-        .to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = Request::builder()
+            .uri("/get_file_info?path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
         assert_eq!(resp.status(), http::StatusCode::OK);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     #[cfg(unix)]
     async fn test_permission_denied() {
         let (temp_dir, state) = setup_test_env().await;
@@ -917,17 +1012,17 @@ mod tests {
             fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
         }
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=restricted")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
 
         fs::set_permissions(
@@ -937,29 +1032,29 @@ mod tests {
         .unwrap();
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_cache_invalidation_after_modification() {
         let (temp_dir, state) = setup_test_env().await;
         let file_path = temp_dir.join("modifiable.txt");
         File::create(&file_path).unwrap().write_all(b"v1").unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state.clone());
 
         // Initial request to populate cache
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
 
-        let body = test::read_body(resp).await;
+        let resp = app.call(req).await.unwrap();
+
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         let fb_data: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         assert_eq!(fb_data.size(), 2);
 
@@ -975,37 +1070,40 @@ mod tests {
             bar.1 = 0; // Set timestamp to epoch to simulate expiration
         }
         // Subsequent request should fetch fresh data
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
 
-        let body = test::read_body(resp).await;
+        let resp = app.call(req).await.unwrap();
+
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         let fb_data: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         assert_eq!(fb_data.size(), 7);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_concurrent_cache_access() {
         // needs some code
         let (_temp_dir, state) = setup_test_env().await;
-        let service = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+
+        let mut app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state.clone());
 
         let mut results = vec![];
 
         for _ in 0..100000 {
-            let req = test::TestRequest::get()
+            let req = Request::builder()
                 .uri("/get_dir_info?path=test_dir")
-                .to_request();
-            results.push(test::call_service(&service, req).await.status());
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            results.push(app.call(req).await.unwrap().status());
         }
 
         for result in results {
@@ -1017,7 +1115,7 @@ mod tests {
         assert_eq!(state.cache_stats.get().0, 99999); // 1 miss + 99999 hits
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_special_char_filenames() {
         let (temp_dir, state) = setup_test_env().await;
         let file_names = vec!["файл.txt", "スペース ファイル", "😀.md"];
@@ -1026,21 +1124,21 @@ mod tests {
             File::create(temp_dir.join(name)).unwrap();
         }
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=.")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
 
-        let body = test::read_body(resp).await;
+        let resp = app.oneshot(req).await.unwrap();
 
-        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+        let bytes = resp.collect().await.unwrap().to_bytes();
+
+        let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
         let entries = fb_data.files().unwrap().name().unwrap();
 
         for name in file_names {
@@ -1048,7 +1146,7 @@ mod tests {
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_symlink_handling() {
         let (temp_dir, state) = setup_test_env().await;
 
@@ -1078,31 +1176,33 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file("..\\secret.txt", &malicious_symlink).unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file").to(read_file_buffer_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_file", axum::routing::get(read_file_buffer_handler))
+            .with_state(state);
 
         // Test valid symlink
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file?path=valid_link.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::OK);
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "valid content");
+        let bytes = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes, "valid content");
 
         // Test malicious symlink
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file?path=malicious_link.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_file_and_data_changes() {
         let (temp_dir, state) = setup_test_env().await;
         let file_path = temp_dir.join("modifiable.txt");
@@ -1120,23 +1220,22 @@ mod tests {
         let accessed_secs =
             crate::utils::windows::time::IntoFileTime::into_file_time(metadata.accessed().unwrap());
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state.clone());
 
         // Initial request to populate cache
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
 
-        let body = test::read_body(resp).await;
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         let fb_data: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), metadata.len());
@@ -1156,22 +1255,24 @@ mod tests {
             bar.1 = 0; // Set timestamp to epoch to simulate expiration
         }
         // Subsequent request should fetch fresh data
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
 
-        let body = test::read_body(resp).await;
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         let fb_data: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), 7);
         assert_eq!(fb_data.created(), created_secs);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_directory_metadata_fields() {
         let (_temp_dir, state) = setup_test_env().await;
 
@@ -1183,24 +1284,23 @@ mod tests {
         let sub_dir = nested_dir.join("sub_directory");
         fs::create_dir(&sub_dir).unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=nested_test_dir")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::OK);
 
-        let body = test::read_body(resp).await;
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         // Parse FlatBuffer data
-        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+        let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
         // Verify there's one directory and no files
         assert_eq!(fb_data.directory_count(), 1);
@@ -1229,7 +1329,7 @@ mod tests {
         assert!(accessed > 0);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_directory_with_mixed_contents() {
         let (_temp_dir, state) = setup_test_env().await;
 
@@ -1250,24 +1350,23 @@ mod tests {
                 .unwrap();
         }
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=mixed_dir")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::OK);
 
-        let body = test::read_body(resp).await;
+        let bytes = resp.collect().await.unwrap().to_bytes();
 
         // Parse FlatBuffer data
-        let fb_data: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+        let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
         // Verify counts
         assert_eq!(fb_data.directory_count(), 3);
@@ -1304,7 +1403,7 @@ mod tests {
         assert!(file_names_set.contains("file_5.txt"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_timestamps_consistency() {
         let (_temp_dir, state) = setup_test_env().await;
 
@@ -1326,30 +1425,33 @@ mod tests {
         let subdir_meta = fs::metadata(&sub_dir).unwrap();
         let file_meta = fs::metadata(&file_path).unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/get_dir_info").to(get_dir_info_handler))
-                .service(web::resource("/get_file_info").to(get_file_info_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+            .route("/get_file_info", axum::routing::get(get_file_info_handler))
+            .with_state(state);
 
         // Test directory listing
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_dir_info?path=timestamp_test")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        let body = test::read_body(resp).await;
-        let fb_dir: Directory = flatbuffers::root::<Directory>(&body).unwrap();
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+
+        let bytes = resp.collect().await.unwrap().to_bytes();
+        let fb_dir: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
         // Test file info
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/get_file_info?path=timestamp_test/test_file.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        let body = test::read_body(resp).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+
+        let bytes = resp.collect().await.unwrap().to_bytes();
         let fb_file: DirectoryEntryMetadata =
-            flatbuffers::root::<DirectoryEntryMetadata>(&body).unwrap();
+            flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         // Verify file timestamps from get_file_info
         let file_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
@@ -1442,87 +1544,87 @@ mod tests {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_find_path_existing() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/find_path").to(find_path_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/find_path", axum::routing::get(find_path_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/find_path?path=test_file.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_find_path_filetype_validation() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/find_path").to(find_path_handler)),
-        )
-        .await;
+        let mut app = Router::new()
+            .route("/find_path", axum::routing::get(find_path_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/find_path?path=test_file.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.call(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::FOUND);
-        assert_eq!(test::read_body(resp).await[0], b'0');
+        assert_eq!(resp.collect().await.unwrap().to_bytes()[0], b'0');
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/find_path?path=test_dir")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::FOUND);
-        assert_eq!(test::read_body(resp).await[0], b'1');
+        assert_eq!(resp.collect().await.unwrap().to_bytes()[0], b'1');
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_find_path_nonexistent() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/find_path").to(find_path_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/find_path", axum::routing::get(find_path_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/find_path?path=nonexistent.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_find_path_path_traversal() {
         let (_temp_dir, state) = setup_test_env().await;
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(web::resource("/find_path").to(find_path_handler)),
-        )
-        .await;
+        let app = Router::new()
+            .route("/find_path", axum::routing::get(find_path_handler))
+            .with_state(state);
 
-        let req = test::TestRequest::get()
+        let req = Request::builder()
             .uri("/find_path?path=../passwd.txt")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
