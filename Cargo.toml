@@ -11,16 +11,17 @@ stats = ["logging"]
 [dependencies]
 axum = "0.8.3"
 dotenvy = { version = "0.15.7", optional = true }
-env_logger = { version = "0.11.7", optional = true }
+env_logger = { version = "0.11.8", optional = true }
 flatbuffers = "25.2.10"
 log = { version = "0.4.27", optional = true }
 scc = "2.3.3"
 serde =  { version = "1.0.219", features = ["derive"]}
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.44.2", features = ["fs", "rt-multi-thread"] }
+notify-debouncer-full = "0.5.0"
 
 [dev-dependencies]
 tempfile = "3.19.1"
-tokio = { version = "1.44.1", features = ["rt", "macros", "test-util"] }
+tokio = { version = "1.44.2", features = ["rt", "macros", "test-util"] }
 http-body-util = "0.1.0"
 tower = { version = "0.5.2", features = ["util"] }
