@@ -167,7 +167,7 @@ pub mod metadata {
             )
         }
 
-        pub fn get_file_serialized(&self, name: &str) -> Option<Vec<u8>> {
+        pub fn get_file_entry_serialized(&self, name: &str) -> Option<Vec<u8>> {
             self.file_map.get(name).map(|&index| {
                 let capacity = Self::estimate_serialized_size(1);
 
@@ -182,6 +182,119 @@ pub mod metadata {
             (std::mem::size_of::<DirEntMetaEntries>() as u64
                 + crate::utils::windows::file::WINDOWS_MAX_PATH)
                 * count as u64
+        }
+    }
+
+    pub async fn handle_fs_events(
+        events: &Vec<notify_debouncer_full::DebouncedEvent>,
+        meta_cache: &scc::HashCache<
+            std::path::PathBuf,
+            (std::sync::Arc<DirectoryLookupContext>, tokio::time::Instant),
+        >,
+    ) {
+        for event in events {
+            match event.kind {
+                notify_debouncer_full::notify::EventKind::Create(_) => {
+                    debug_assert_eq!(event.paths.len(), 1);
+
+                    crate::log_trace!("file watch event info: {:?}", event);
+
+                    let Some(path) = event.paths.first() else {
+                        continue;
+                    };
+
+                    if let Some(parent_path) = path.parent() {
+                        // Remove parent's cache entry as it will now be dirty if it exists
+                        _ = meta_cache
+                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
+                            .await;
+                    };
+                }
+                notify_debouncer_full::notify::EventKind::Remove(remove_kind) => {
+                    debug_assert_eq!(event.paths.len(), 1);
+
+                    crate::log_trace!("file watch event info: {:?}", event);
+
+                    let Some(path) = event.paths.first() else {
+                        continue;
+                    };
+
+                    if let Some(parent_path) = path.parent() {
+                        _ = meta_cache
+                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
+                            .await;
+                    }
+
+                    match remove_kind {
+                        notify_debouncer_full::notify::event::RemoveKind::File => {
+                            _ = meta_cache
+                                .remove_if_async(path, |entry| event.time > entry.1.into())
+                                .await;
+                        }
+                        notify_debouncer_full::notify::event::RemoveKind::Folder => {
+                            meta_cache
+                                .retain_async(|key, value| {
+                                    // Keep if the key is outside the path
+                                    if !key.starts_with(path) {
+                                        return true;
+                                    }
+
+                                    // Keep if the entry timestamp is newer than the event's
+                                    if event.time <= value.1.into() {
+                                        return true;
+                                    }
+
+                                    // Otherwise, remove it
+                                    false
+                                })
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
+                notify_debouncer_full::notify::EventKind::Modify(_) => {
+                    crate::log_trace!("file watch event info: {:?}", event);
+
+                    let Some(path) = event.paths.first() else {
+                        continue;
+                    };
+
+                    if let Some(parent_path) = path.parent() {
+                        _ = meta_cache
+                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
+                            .await;
+                    }
+
+                    // this is ugly but since we have no file/directory context it'll have to do
+                    meta_cache
+                        .retain_async(|key, value| {
+                            // Keep if the key is outside the path
+                            if !key.starts_with(path) {
+                                return true;
+                            }
+
+                            // Keep if the entry timestamp is newer than the event's
+                            if event.time <= value.1.into() {
+                                return true;
+                            }
+
+                            // Otherwise, remove it
+                            false
+                        })
+                        .await;
+                }
+                notify_debouncer_full::notify::EventKind::Other => {
+                    crate::log_trace!("file watch event info: {:?}", event);
+                    if event.need_rescan() {
+                        crate::log_warn!("file watch rescan flag received, cache invalidated");
+                        meta_cache.clear_async().await;
+                        return;
+                    }
+                }
+                _ => {
+                    crate::log_trace!("file watch event info: {:?}", event);
+                }
+            }
         }
     }
 }
