@@ -167,7 +167,7 @@ pub mod metadata {
             )
         }
 
-        pub fn get_file_serialized(&self, name: &str) -> Option<Vec<u8>> {
+        pub fn get_file_entry_serialized(&self, name: &str) -> Option<Vec<u8>> {
             self.file_map.get(name).map(|&index| {
                 let capacity = Self::estimate_serialized_size(1);
 
@@ -182,6 +182,65 @@ pub mod metadata {
             (std::mem::size_of::<DirEntMetaEntries>() as u64
                 + crate::utils::windows::file::WINDOWS_MAX_PATH)
                 * count as u64
+        }
+    }
+
+    pub async fn handle_fs_events(
+        events: &Vec<notify_debouncer_full::DebouncedEvent>,
+        meta_cache: &scc::HashCache<
+            std::path::PathBuf,
+            (std::sync::Arc<DirectoryLookupContext>, tokio::time::Instant),
+        >,
+    ) {
+        for event in events {
+            match event.kind {
+                notify_debouncer_full::notify::EventKind::Create(_) => {
+                    for path in &event.paths {
+                        crate::log_trace!("file watch event info: {:?}", event);
+
+                        if let Some(parent_path) = path.parent() {
+                            // Remove parent's cache entry as it will now be dirty if it exists
+                            _ = meta_cache.remove_async(parent_path).await;
+                        };
+                    }
+                }
+                notify_debouncer_full::notify::EventKind::Modify(_)
+                | notify_debouncer_full::notify::EventKind::Remove(_) => {
+                    for path in &event.paths {
+                        crate::log_trace!("file watch event info: {:?}", event);
+
+                        // Remove path itself as it is now dirty
+                        _ = meta_cache.remove_async(path).await;
+
+                        if let Some(parent_path) = path.parent() {
+                            // Remove parent's cache entry as it will now be dirty if it exists
+                            _ = meta_cache.remove_async(parent_path).await;
+                        };
+
+                        if !path.is_file() {
+                            // Remove any entry whose path starts with our removed directory's path
+                            meta_cache
+                                .retain_async(|key, _| {
+                                    // Keep entries that don't start with the removed path or are exactly the removed path
+                                    // (the exact path is already removed earlier with meta_cache.remove_async but could be potentially added again in this window)
+                                    !key.starts_with(path) || key == path
+                                })
+                                .await;
+                        }
+                    }
+                }
+                notify_debouncer_full::notify::EventKind::Other => {
+                    crate::log_trace!("file watch event info: {:?}", event);
+                    if event.need_rescan() {
+                        crate::log_warn!("file watch rescan flag received, cache invalidated");
+                        meta_cache.clear_async().await;
+                        return;
+                    }
+                }
+                _ => {
+                    crate::log_trace!("file watch event info: {:?}", event);
+                }
+            }
         }
     }
 }

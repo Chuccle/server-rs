@@ -26,8 +26,6 @@ enum AppError {
     Internal,
     #[error("Invalid path format")]
     InvalidPath,
-    #[error("System time error")]
-    SystemTime(#[from] std::time::SystemTimeError),
     #[error("Task execution failed")]
     TaskJoin(#[from] tokio::task::JoinError),
     #[error("Numerical conversion error")]
@@ -71,7 +69,7 @@ impl axum::response::IntoResponse for AppError {
                 axum::http::StatusCode::BAD_REQUEST.into_response()
             }
             Self::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
-            Self::Internal | Self::SystemTime(_) | Self::TaskJoin(_) | Self::TryFromInt(_) => {
+            Self::Internal | Self::TaskJoin(_) | Self::TryFromInt(_) => {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
@@ -84,13 +82,18 @@ struct PathQuery {
 }
 
 struct AppState {
-    meta_cache:
-        scc::HashCache<std::path::PathBuf, (utils::cache::metadata::DirectoryLookupContext, u64)>,
+    meta_cache: scc::HashCache<
+        std::path::PathBuf,
+        (
+            std::sync::Arc<utils::cache::metadata::DirectoryLookupContext>,
+            tokio::time::Instant,
+        ),
+    >,
     base_path: std::path::PathBuf,
     cache_stats: utils::stats::Cache,
 }
 
-const CACHE_TTL_SECONDS: u64 = 300;
+const CACHE_TTL_SECONDS: u64 = 30;
 
 fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     let mut stack = Vec::new();
@@ -198,48 +201,47 @@ async fn get_file_info_handler(
     })?;
 
     log_debug!("Checking cache for parent directory: {:?}", parent_dir);
-    let cache_result = data.meta_cache.get_async(parent_dir).await;
 
-    match &cache_result {
-        Some(entry) => {
-            let (cached_meta, timestamp) = entry.get();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
+    if let Some(entry) = data
+        .meta_cache
+        .read_async(parent_dir, |_, v| v.clone())
+        .await
+    {
+        let (cached_meta, timestamp) = entry;
 
-            log_trace!(
-                "Cache entry found - Timestamp: {}, Current: {}, TTL: {}",
-                timestamp,
-                now,
-                CACHE_TTL_SECONDS
-            );
+        let now = tokio::time::Instant::now();
 
-            if now - timestamp < CACHE_TTL_SECONDS {
-                data.cache_stats.increment_hits();
-                log_debug!("Cache hit for directory: {:?}", parent_dir);
+        log_trace!(
+            "Cache entry found - Timestamp: {:?}, Current: {:?}, TTL: {}",
+            timestamp,
+            now,
+            CACHE_TTL_SECONDS
+        );
 
-                let file_name = normalized_requested
-                    .file_name()
-                    .ok_or(AppError::InvalidPath)?
-                    .to_str()
-                    .ok_or(AppError::InvalidPathEncoding)?;
+        if now - timestamp < tokio::time::Duration::from_secs(CACHE_TTL_SECONDS) {
+            data.cache_stats.increment_hits();
+            log_debug!("Cache hit for directory: {:?}", parent_dir);
 
-                log_trace!("Looking for file in cache: {}", file_name);
+            let file_name = normalized_requested
+                .file_name()
+                .ok_or(AppError::InvalidPath)?
+                .to_str()
+                .ok_or(AppError::InvalidPathEncoding)?;
 
-                if let Some(dir_ent) = cached_meta.get_file_serialized(file_name) {
-                    log_debug!("File found in cache: {}", file_name);
-                    return Ok(dir_ent);
-                }
-            } else {
-                log_debug!("Cache entry expired for: {:?}", parent_dir);
-                data.cache_stats.increment_misses();
-            }
+            return cached_meta
+                .get_file_entry_serialized(file_name)
+                .ok_or(AppError::Internal);
         }
-        None => {
-            log_debug!("Cache miss for directory: {:?}", parent_dir);
-            data.cache_stats.increment_misses();
-        }
+
+        log_debug!("Cache entry expired for: {:?}", &parent_dir);
+        _ = data
+            .meta_cache
+            .remove_if_async(&normalized_requested, |entry| entry.1 == timestamp)
+            .await;
     }
+
+    data.cache_stats.increment_misses();
+
     log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
     let meta = tokio::fs::symlink_metadata(&normalized_requested).await?;
 
@@ -322,39 +324,53 @@ async fn get_dir_info_handler(
     }
 
     log_debug!("Checking cache for directory: {:?}", &normalized_requested);
-    if let Some(mut cache_entry) = data.meta_cache.get_async(&normalized_requested).await {
-        let (cached_dir_meta, timestamp) = cache_entry.get();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+    if let Some(cache_entry) = data
+        .meta_cache
+        .read_async(&normalized_requested, |_, v| v.clone())
+        .await
+    {
+        let (cached_dir_meta, timestamp) = cache_entry;
 
-        if now - timestamp < CACHE_TTL_SECONDS {
+        let now = tokio::time::Instant::now();
+
+        log_trace!(
+            "Cache entry found - Timestamp: {:?}, Current: {:?}, TTL: {}",
+            timestamp,
+            now,
+            CACHE_TTL_SECONDS
+        );
+
+        if now - timestamp < tokio::time::Duration::from_secs(CACHE_TTL_SECONDS) {
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", &normalized_requested);
             return Ok(cached_dir_meta.get_all_entries_serialized());
         }
 
         log_debug!("Expired cache entry: {:?}", &normalized_requested);
-        data.cache_stats.increment_misses();
-        let directory_entry = &create_meta_cache_entry(cache_entry.key().to_owned()).await?;
-        cache_entry.put((directory_entry.clone(), now));
-        return Ok(directory_entry.get_all_entries_serialized());
+        _ = data
+            .meta_cache
+            .remove_if_async(&normalized_requested, |entry| entry.1 == timestamp)
+            .await;
     }
 
     data.cache_stats.increment_misses();
 
     let directory_entry = &create_meta_cache_entry(normalized_requested.clone()).await?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-
-    data.meta_cache
-        .put(normalized_requested, (directory_entry.clone(), now))
+    _ = data
+        .meta_cache
+        .put_async(
+            normalized_requested,
+            (
+                std::sync::Arc::new(directory_entry.clone()),
+                tokio::time::Instant::now(),
+            ),
+        )
+        .await
         .map_err(|e| {
             log_warn_with_context!(e, "Failed to insert entry into cache");
             e
-        })?;
+        });
 
     Ok(directory_entry.get_all_entries_serialized())
 }
@@ -469,6 +485,11 @@ async fn main() -> std::io::Result<()> {
     #[cfg(feature = "stats")]
     start_cache_statistics_logger(axum::extract::State(state.clone()));
 
+    if let Err(e) = start_fs_watcher(path.clone(), state.clone()) {
+        log_error_with_context!(e, "Failed to create file watcher");
+        std::process::exit(1);
+    }
+
     let app = axum::Router::new()
         .route("/get_file_info", axum::routing::get(get_file_info_handler))
         .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -488,13 +509,50 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+fn start_fs_watcher(
+    path: std::path::PathBuf,
+    state: std::sync::Arc<AppState>,
+) -> Result<(), notify_debouncer_full::notify::Error> {
+    tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+
+        let mut debouncer = notify_debouncer_full::new_debouncer(
+            tokio::time::Duration::from_secs(2),
+            None,
+            move |res| {
+                if let Err(e) = tx.blocking_send(res) {
+                    log_error_with_context!(e, "watch send error");
+                }
+            },
+        )?;
+
+        debouncer.watch(
+            &path,
+            notify_debouncer_full::notify::RecursiveMode::Recursive,
+        )?;
+
+        while let Some(res) = rx.recv().await {
+            match res {
+                Ok(events) => {
+                    utils::cache::metadata::handle_fs_events(&events, &state.meta_cache).await;
+                }
+                Err(e) => {
+                    log_error_with_context!(e, "watch receive error");
+                }
+            }
+        }
+        Ok::<(), notify_debouncer_full::notify::Error>(())
+    });
+
+    Ok(())
+}
+
 #[cfg(feature = "stats")]
 fn start_cache_statistics_logger(state: axum::extract::State<std::sync::Arc<AppState>>) {
-    const STATS_LOG_INTERVAL_SECONDS: u64 = 30;
-
     tokio::spawn(async move {
+        const STATS_LOG_INTERVAL_SECONDS: u64 = 30;
         let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(STATS_LOG_INTERVAL_SECONDS));
+            tokio::time::interval(tokio::time::Duration::from_secs(STATS_LOG_INTERVAL_SECONDS));
         loop {
             interval.tick().await;
             let (hits, misses) = state.cache_stats.get();
@@ -551,6 +609,11 @@ mod tests {
             base_path: base_dir.clone(),
             cache_stats: utils::stats::Cache::new(),
         });
+
+        if let Err(e) = start_fs_watcher(base_dir.clone(), state.clone()) {
+            log_error_with_context!(e, "Failed to create file watcher");
+            std::process::exit(1);
+        }
 
         (base_dir, state)
     }
@@ -915,7 +978,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let _ = app.call(req).await.unwrap();
+        _ = app.call(req).await.unwrap();
         assert_eq!(state.cache_stats.get().0, 0);
         assert_eq!(state.cache_stats.get().1, 1);
 
@@ -926,7 +989,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let _ = app.call(req).await.unwrap();
+        _ = app.call(req).await.unwrap();
         assert_eq!(state.cache_stats.get().0, 1);
         assert_eq!(state.cache_stats.get().1, 1);
     }
@@ -938,22 +1001,18 @@ mod tests {
 
         // Manually insert an expired cache entry
         let path = state.base_path.join("test_dir");
-        let old_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - CACHE_TTL_SECONDS
-            - 1;
 
         state
             .meta_cache
-            .put(
+            .put_async(
                 path.clone(),
                 (
-                    utils::cache::metadata::DirectoryLookupContext::new(),
-                    old_time,
+                    std::sync::Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                    tokio::time::Instant::now()
+                        - tokio::time::Duration::from_secs(CACHE_TTL_SECONDS),
                 ),
             )
+            .await
             .unwrap();
 
         let app = Router::new()
@@ -1032,7 +1091,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cache_invalidation_after_modification() {
         let (temp_dir, state) = setup_test_env().await;
         let file_path = temp_dir.join("modifiable.txt");
@@ -1058,17 +1117,14 @@ mod tests {
 
         assert_eq!(fb_data.size(), 2);
 
+        tokio::time::advance(tokio::time::Duration::from_secs(CACHE_TTL_SECONDS)).await;
+
         // Modify the file
         File::create(&file_path)
             .unwrap()
             .write_all(b"updated")
             .unwrap();
 
-        // Fast-forward time beyond TTL
-        if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
-            let bar = foo.get_mut();
-            bar.1 = 0; // Set timestamp to epoch to simulate expiration
-        }
         // Subsequent request should fetch fresh data
         let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
@@ -1202,7 +1258,7 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_file_and_data_changes() {
         let (temp_dir, state) = setup_test_env().await;
         let file_path = temp_dir.join("modifiable.txt");
@@ -1249,11 +1305,8 @@ mod tests {
             .write_all(b"updated")
             .unwrap();
 
-        // Fast-forward time beyond TTL
-        if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
-            let bar = foo.get_mut();
-            bar.1 = 0; // Set timestamp to epoch to simulate expiration
-        }
+        tokio::time::advance(tokio::time::Duration::from_secs(CACHE_TTL_SECONDS)).await;
+
         // Subsequent request should fetch fresh data
         let req = Request::builder()
             .uri("/get_file_info?path=modifiable.txt")
