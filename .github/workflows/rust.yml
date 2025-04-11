@@ -11,35 +11,68 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        feature: [ "no-default-features", "logging", "stats" ]
+
     steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: |
+        echo "is_dependabot=false" >> $GITHUB_OUTPUT
+        if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+          echo "is_dependabot=true" >> $GITHUB_OUTPUT
+        fi
+
     - name: Checkout repository and submodules
       uses: actions/checkout@v4
       with:
-        token: ${{ secrets.GH_PAT }}
-        submodules: 'recursive'
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GITHUB_TOKEN || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Install build tools
       run: sudo apt update && sudo apt install -y cmake make
-    - name: Build Flatc
-      run: cd buildtools/flatbuffers && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && make && sudo make install
-    - name: Build with no features
-      run: cargo build --no-default-features --verbose
-    - name: Build with logging
-      run: cargo build --features logging --verbose
-    - name: Build with stats
-      run: cargo build --features stats --verbose
-    - name: Run tests with no features
-      run: cargo test --no-default-features --verbose
-    - name: Run tests with logging
-      run: cargo test --features logging --verbose
-    - name: Run tests with stats
-      run: cargo test --features stats --verbose
-    - name: Run clippy with no features
-      run: cargo clippy --no-default-features
-    - name: Run clippy with logging
-      run: cargo clippy --features logging
-    - name: Run clippy with stats
-      run: cargo clippy --features stats
 
+    - name: Build Flatc
+      run: |
+        cd buildtools/flatbuffers
+        cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release .
+        make
+        sudo make install
+
+    - name: Build
+      run: |
+        if [ "${{ matrix.feature }}" = "no-default-features" ]; then
+          cargo build --no-default-features --verbose
+        else
+          cargo build --features ${{ matrix.feature }} --verbose
+        fi
+
+    - name: Test
+      run: |
+        if [ "${{ matrix.feature }}" = "no-default-features" ]; then
+          cargo test --no-default-features --verbose
+        else
+          cargo test --features ${{ matrix.feature }} --verbose
+        fi
+
+    - name: Clippy
+      run: |
+        if [ "${{ matrix.feature }}" = "no-default-features" ]; then
+          cargo clippy --no-default-features --all-targets -- -D warnings
+        else
+          cargo clippy --features ${{ matrix.feature }} --all-targets -- -D warnings
+        fi
