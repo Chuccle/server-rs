@@ -22,3 +22,10 @@ updates:
         - dependency-name: "semver"
         - dependency-name: "crates-io"
     rebase-strategy: "disabled"
+
+version: 2
+updates:
+ - package-ecosystem: "gitsubmodule"
+   directory: "/"
+   schedule:
+     interval: weekly
