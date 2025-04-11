@@ -5,27 +5,33 @@
 # https://containers.dev/guide/dependabot
 
 version: 2
-updates:
- - package-ecosystem: "devcontainers"
-   directory: "/"
-   schedule:
-     interval: weekly
+registries:
+  schemas:
+    type: git
+    url: https://github.com
+    username: x-access-token
+    password: ${{secrets.GH_DEPENDABOT_PAT}}
 
-version: 2
+
 updates:
+  - package-ecosystem: "devcontainers"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     ignore:
-        # These are peer deps of Cargo and should not be automatically bumped
-        - dependency-name: "semver"
-        - dependency-name: "crates-io"
+      - dependency-name: "semver"
+      - dependency-name: "crates-io"
     rebase-strategy: "disabled"
 
-version: 2
-updates:
- - package-ecosystem: "gitsubmodule"
-   directory: "/"
-   schedule:
-     interval: weekly
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    registries:
+      - schemas # Allow version updates for dependencies in this registry
+    schedule:
+      interval: "weekly"
+
