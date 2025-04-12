@@ -36,24 +36,40 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
 
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      run: |
+        cd buildtools/flatbuffers
+        echo "flatc_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Cache Flatc build
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/flatc
+        key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
+            
     - name: Install build tools
       run: sudo apt update && sudo apt install -y cmake make
 
     - name: Build Flatc
       run: |
-        cd buildtools/flatbuffers
-        cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release .
-        make
-        sudo make install
+        if ! command -v flatc &> /dev/null; then
+          cd buildtools/flatbuffers
+          cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release .
+          make
+          sudo make install
+        else
+          echo "Flatc already cached, skipping build."
+        fi
 
-    - name: Build
+    - name: Build ${{ github.repository }}
       run: |
         if [ "${{ matrix.feature }}" = "no-default-features" ]; then
           cargo build --no-default-features --verbose
@@ -61,7 +77,7 @@ jobs:
           cargo build --features ${{ matrix.feature }} --verbose
         fi
 
-    - name: Test
+    - name: Test ${{ github.repository }}
       run: |
         if [ "${{ matrix.feature }}" = "no-default-features" ]; then
           cargo test --no-default-features --verbose
@@ -69,7 +85,7 @@ jobs:
           cargo test --features ${{ matrix.feature }} --verbose
         fi
 
-    - name: Clippy
+    - name: Clippy ${{ github.repository }}
       run: |
         if [ "${{ matrix.feature }}" = "no-default-features" ]; then
           cargo clippy --no-default-features --all-targets -- -D warnings
