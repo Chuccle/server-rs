@@ -10,8 +10,8 @@ mod generated {
 mod utils;
 
 // TODO:
-// We need to use inotify for cache invalidation, we can then remove timestamp coupled to each entry
-// We need to investigate compression on /get_dir_info and /get_file_info
+// File serving caching/chunking
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("Path traversal attempt detected")]
