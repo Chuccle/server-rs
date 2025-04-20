@@ -122,10 +122,8 @@ fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     }
 }
 
-fn create_buffer_serialized(metadata: &std::fs::Metadata, name: &str) -> Result<Vec<u8>, AppError> {
+fn create_buffer_serialized(metadata: &std::fs::Metadata) -> Result<Vec<u8>, AppError> {
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(512);
-
-    let name_fb = builder.create_string(name);
 
     let created_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
         metadata
@@ -148,7 +146,6 @@ fn create_buffer_serialized(metadata: &std::fs::Metadata, name: &str) -> Result<
     let entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
         &mut builder,
         &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-            name: Some(name_fb),
             size: metadata.len(),
             created: created_secs,
             modified: modified_secs,
@@ -245,14 +242,8 @@ async fn get_file_info_handler(
     log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
     let meta = tokio::fs::symlink_metadata(&normalized_requested).await?;
 
-    let file_name = normalized_requested
-        .file_name()
-        .ok_or(AppError::InvalidPath)?
-        .to_str()
-        .ok_or(AppError::InvalidPathEncoding)?;
-
-    let file_entry = create_buffer_serialized(&meta, file_name).map_err(|e| {
-        log_error_with_context!(e, "Failed to create directory entry for {}", file_name);
+    let file_entry = create_buffer_serialized(&meta).map_err(|e| {
+        log_error_with_context!(e, "Failed to create directory entry");
         e
     })?;
 
@@ -646,7 +637,6 @@ mod tests {
         let fb_data: DirectoryEntryMetadata =
             flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
-        assert_eq!(fb_data.name(), "test_file.txt");
         assert_eq!(fb_data.size(), 12);
     }
 
@@ -1303,7 +1293,6 @@ mod tests {
         let fb_data: DirectoryEntryMetadata =
             flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
-        assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), metadata.len());
         assert_eq!(fb_data.created(), created_secs);
         assert_eq!(fb_data.modified(), modified_secs);
@@ -1334,7 +1323,6 @@ mod tests {
         let fb_data: DirectoryEntryMetadata =
             flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
-        assert_eq!(fb_data.name(), "modifiable.txt");
         assert_eq!(fb_data.size(), 7);
         assert_eq!(fb_data.created(), created_secs);
     }

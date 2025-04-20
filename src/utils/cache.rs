@@ -153,12 +153,9 @@ pub mod metadata {
             idx: usize,
         ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntryMetadata<'a>>
         {
-            let file_name = builder.create_string(&self.files.names[idx]);
-
             crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
                 builder,
                 &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-                    name: Some(file_name),
                     size: self.files.sizes[idx],
                     created: self.files.created_times[idx],
                     modified: self.files.modified_times[idx],
