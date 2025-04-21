@@ -69,14 +69,6 @@ jobs:
           echo "Flatc already cached, skipping build."
         fi
 
-    - name: Build ${{ github.repository }}
-      run: |
-        if [ "${{ matrix.feature }}" = "no-default-features" ]; then
-          cargo build --no-default-features --verbose
-        else
-          cargo build --features ${{ matrix.feature }} --verbose
-        fi
-
     - name: Test ${{ github.repository }}
       run: |
         if [ "${{ matrix.feature }}" = "no-default-features" ]; then
@@ -92,3 +84,23 @@ jobs:
         else
           cargo clippy --features ${{ matrix.feature }} --all-targets -- -D warnings
         fi
+
+    - name: Build binaries on master builds
+      if: github.ref == 'refs/heads/master'
+      run: | 
+        rustup target add x86_64-unknown-linux-musl
+        sudo apt-get install -y musl-tools
+        if [ "${{ matrix.feature }}" = "no-default-features" ]; then
+          cargo build --no-default-features --verbose --release --target=x86_64-unknown-linux-musl
+        else
+          cargo build --features ${{ matrix.feature }} --verbose --release --target=x86_64-unknown-linux-musl
+        fi
+        BIN_PATH="target/x86_64-unknown-linux-musl/release/server-rs"
+        strip "$BIN_PATH"
+
+    - name: Upload binary artifact
+      if: github.ref == 'refs/heads/master'
+      uses: actions/upload-artifact@v4
+      with:
+        name: server-rs-${{ matrix.feature }}-x86_64-unknown-linux-musl
+        path: target/x86_64-unknown-linux-musl/release/server-rs
