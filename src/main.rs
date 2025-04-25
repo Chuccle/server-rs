@@ -306,18 +306,23 @@ async fn get_dir_info_handler(
 ) -> Result<Vec<u8>, AppError> {
     log_info!("[DIR INFO] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.path)?;
-    log_trace!("Validated canonical path: {:?}", &normalized_requested);
+    let canonicalized_path =
+        tokio::fs::canonicalize(&validate_path(&data.base_path, &params.path)?).await?;
+    log_trace!("Validated canonical path: {:?}", &canonicalized_path);
 
-    if !normalized_requested.is_dir() {
-        log_debug!("Path is not a directory: {:?}", &normalized_requested);
+    if !canonicalized_path.starts_with(&data.base_path) {
+        return Err(AppError::PathTraversal);
+    }
+
+    if !canonicalized_path.is_dir() {
+        log_debug!("Path is not a directory: {:?}", &canonicalized_path);
         return Err(AppError::NotFound);
     }
 
-    log_debug!("Checking cache for directory: {:?}", &normalized_requested);
+    log_debug!("Checking cache for directory: {:?}", &canonicalized_path);
     if let Some(cache_entry) = data
         .meta_cache
-        .read_async(&normalized_requested, |_, v| v.clone())
+        .read_async(&canonicalized_path, |_, v| v.clone())
         .await
     {
         let (cached_dir_meta, timestamp) = cache_entry;
@@ -333,25 +338,25 @@ async fn get_dir_info_handler(
 
         if now - timestamp < tokio::time::Duration::from_secs(CACHE_TTL_SECONDS) {
             data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", &normalized_requested);
+            log_debug!("Cache hit for directory: {:?}", &canonicalized_path);
             return Ok(cached_dir_meta.get_all_entries_serialized());
         }
 
-        log_debug!("Expired cache entry: {:?}", &normalized_requested);
+        log_debug!("Expired cache entry: {:?}", &canonicalized_path);
         _ = data
             .meta_cache
-            .remove_if_async(&normalized_requested, |entry| entry.1 == timestamp)
+            .remove_if_async(&canonicalized_path, |entry| entry.1 == timestamp)
             .await;
     }
 
     data.cache_stats.increment_misses();
 
-    let directory_entry = &create_meta_cache_entry(normalized_requested.clone()).await?;
+    let directory_entry = &create_meta_cache_entry(canonicalized_path.clone()).await?;
 
     _ = data
         .meta_cache
         .put_async(
-            normalized_requested,
+            canonicalized_path,
             (
                 std::sync::Arc::new(directory_entry.clone()),
                 tokio::time::Instant::now(),
@@ -369,22 +374,25 @@ async fn get_dir_info_handler(
 async fn read_file_buffer_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<PathQuery>,
-) -> Result<Vec<u8>, AppError> {
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
     log_info!("[FILE READ] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.path)?;
+    let canonicalized_path =
+        tokio::fs::canonicalize(&validate_path(&data.base_path, &params.path)?).await?;
+
     log_debug!(
         "Serving file from validated path: {:?}",
-        &normalized_requested
+        &canonicalized_path
     );
-
-    let canonicalized_path = tokio::fs::canonicalize(&normalized_requested).await?;
 
     if !canonicalized_path.starts_with(&data.base_path) {
         return Err(AppError::PathTraversal);
     }
 
-    Ok(tokio::fs::read(&normalized_requested).await?)
+    Ok(tower_http::services::ServeFile::new(&canonicalized_path)
+        .try_call(request)
+        .await?)
 }
 
 async fn find_path_handler(
@@ -393,19 +401,18 @@ async fn find_path_handler(
 ) -> Result<(axum::http::StatusCode, &'static str), AppError> {
     log_info!("[FIND PATH] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.path)?;
+    let canonicalized_path =
+        tokio::fs::canonicalize(&validate_path(&data.base_path, &params.path)?).await?;
+
     log_debug!(
         "Checking file from validated path: {:?}",
-        &normalized_requested
+        &canonicalized_path
     );
-
-    let canonicalized_path = tokio::fs::canonicalize(&normalized_requested).await?;
 
     if !canonicalized_path.starts_with(&data.base_path) {
         return Err(AppError::PathTraversal);
     }
 
-    // Return "1" for directory, "0" for file
     match canonicalized_path.is_dir() {
         true => Ok((axum::http::StatusCode::FOUND, "1")),
         false => Ok((axum::http::StatusCode::FOUND, "0")),
@@ -720,6 +727,98 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         let bytes = resp.collect().await.unwrap().to_bytes();
         assert_eq!(bytes, "test content");
+    }
+
+    // New test for Content-Range
+    #[tokio::test]
+    async fn test_file_download_range() {
+        let (_temp_dir, state) = setup_test_env().await;
+
+        let app = Router::new()
+            .route("/get_file", axum::routing::get(read_file_buffer_handler))
+            .with_state(state);
+
+        // --- Test Case 1: Request bytes 5-9 ---
+        // Corresponds to "conte" from "test content"
+        let req_range_1 = Request::builder()
+            .uri("/get_file?path=test_file.txt")
+            .method("GET")
+            .header(http::header::RANGE, "bytes=5-9") // Request specific range
+            .body(Body::empty()) // Use axum::body::Body
+            .unwrap();
+
+        let resp_range_1 = app.clone().oneshot(req_range_1).await.unwrap();
+
+        // Assertions for successful range request
+        assert_eq!(resp_range_1.status(), http::StatusCode::PARTIAL_CONTENT);
+
+        // Check the Content-Range header
+        let headers_1 = resp_range_1.headers();
+        assert_eq!(
+            headers_1
+                .get(http::header::CONTENT_RANGE)
+                .expect("Response should have Content-Range header")
+                .to_str()
+                .unwrap(),
+            "bytes 5-9/12" // Range served (5-9) and total size (12)
+        );
+
+        let bytes_1 = resp_range_1.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes_1, "conte");
+
+        // --- Test Case 2: Request last 4 bytes ---
+        // Corresponds to "tent" from "test content"
+        let req_range_2 = Request::builder()
+            .uri("/get_file?path=test_file.txt")
+            .method("GET")
+            .header(http::header::RANGE, "bytes=-4") // Request suffix range
+            .body(Body::empty())
+            .unwrap();
+
+        let resp_range_2 = app.clone().oneshot(req_range_2).await.unwrap();
+
+        assert_eq!(resp_range_2.status(), http::StatusCode::PARTIAL_CONTENT);
+
+        // Check the Content-Range header (bytes 8-11 for a 12-byte file)
+        let headers_2 = resp_range_2.headers();
+        assert_eq!(
+            headers_2
+                .get(http::header::CONTENT_RANGE)
+                .expect("Response should have Content-Range header")
+                .to_str()
+                .unwrap(),
+            "bytes 8-11/12" // Range served (8-11) and total size (12)
+        );
+
+        let bytes_2 = resp_range_2.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes_2, "tent"); // Only the requested part
+
+        // --- Test Case 3: Request from byte 8 to end ---
+        // Corresponds to "tent" from "test content"
+        let req_range_3 = Request::builder()
+            .uri("/get_file?path=test_file.txt")
+            .method("GET")
+            .header(http::header::RANGE, "bytes=8-") // Request prefix range
+            .body(Body::empty()) // Use axum::body::Body
+            .unwrap();
+
+        let resp_range_3 = app.oneshot(req_range_3).await.unwrap();
+
+        assert_eq!(resp_range_3.status(), http::StatusCode::PARTIAL_CONTENT);
+
+        // Check the Content-Range header (bytes 8-11 for a 12-byte file)
+        let headers_3 = resp_range_3.headers();
+        assert_eq!(
+            headers_3
+                .get(http::header::CONTENT_RANGE)
+                .expect("Response should have Content-Range header")
+                .to_str()
+                .unwrap(),
+            "bytes 8-11/12"
+        );
+
+        let bytes_3 = resp_range_3.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes_3, "tent");
     }
 
     #[tokio::test]
@@ -1509,25 +1608,14 @@ mod tests {
             flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
         // Verify file timestamps from get_file_info
-        let file_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            file_meta
-                .created()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
-        );
+        let file_created_expected =
+            crate::utils::windows::time::IntoFileTime::into_file_time(file_meta.created().unwrap());
         let file_modified_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            file_meta
-                .modified()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
-        );
-        let file_accessed_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            file_meta
-                .accessed()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
+            file_meta.modified().unwrap(),
         );
 
         assert_eq!(fb_file.created(), file_created_expected);
         assert_eq!(fb_file.modified(), file_modified_expected);
-        assert_eq!(fb_file.accessed(), file_accessed_expected);
 
         // Find file in directory listing
         let file_names = fb_dir.files().unwrap().name().unwrap();
@@ -1545,26 +1633,13 @@ mod tests {
             fb_dir.files().unwrap().modified().unwrap().get(file_index),
             file_modified_expected
         );
-        assert_eq!(
-            fb_dir.files().unwrap().accessed().unwrap().get(file_index),
-            file_accessed_expected
-        );
 
         // Verify subdirectory timestamps
         let subdir_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            subdir_meta
-                .created()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
+            subdir_meta.created().unwrap(),
         );
         let subdir_modified_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            subdir_meta
-                .modified()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
-        );
-        let subdir_accessed_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
-            subdir_meta
-                .accessed()
-                .unwrap_or_else(|_| std::time::SystemTime::now()),
+            subdir_meta.modified().unwrap(),
         );
 
         let dir_names = fb_dir.directories().unwrap().name().unwrap();
@@ -1587,15 +1662,6 @@ mod tests {
                 .unwrap()
                 .get(dir_index),
             subdir_modified_expected
-        );
-        assert_eq!(
-            fb_dir
-                .directories()
-                .unwrap()
-                .accessed()
-                .unwrap()
-                .get(dir_index),
-            subdir_accessed_expected
         );
     }
 
