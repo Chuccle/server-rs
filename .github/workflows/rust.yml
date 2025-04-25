@@ -50,24 +50,23 @@ jobs:
         echo "flatc_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
     - name: Cache Flatc build
+      id: cache_flatc
       uses: actions/cache@v4
       with:
         path: /usr/local/bin/flatc
         key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
             
     - name: Install build tools
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
       run: sudo apt update && sudo apt install -y cmake make
 
     - name: Build Flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
       run: |
-        if ! command -v flatc &> /dev/null; then
           cd buildtools/flatbuffers
           cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release .
           make
           sudo make install
-        else
-          echo "Flatc already cached, skipping build."
-        fi
 
     - name: Test ${{ github.repository }}
       run: |
