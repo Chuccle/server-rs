@@ -371,7 +371,7 @@ async fn get_dir_info_handler(
     Ok(directory_entry.get_all_entries_serialized())
 }
 
-async fn read_file_buffer_handler(
+async fn file_download_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<PathQuery>,
     request: axum::http::Request<axum::body::Body>,
@@ -491,7 +491,8 @@ async fn main() -> std::io::Result<()> {
     let app = axum::Router::new()
         .route("/get_file_info", axum::routing::get(get_file_info_handler))
         .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-        .route("/get_file", axum::routing::get(read_file_buffer_handler))
+        .route("/get_file", axum::routing::get(file_download_handler))
+        .route("/get_file", axum::routing::head(file_download_handler))
         .route("/find_path", axum::routing::get(find_path_handler))
         .route(
             "/healthcheck",
@@ -1215,7 +1216,7 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let app = Router::new()
-                .route("/get_file", axum::routing::get(read_file_buffer_handler))
+                .route("/get_file", axum::routing::get(file_download_handler))
                 .with_state(state);
 
             let req = Request::builder()
@@ -1236,7 +1237,7 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let app = Router::new()
-                .route("/get_file", axum::routing::get(read_file_buffer_handler))
+                .route("/get_file", axum::routing::get(file_download_handler))
                 .with_state(state);
 
             // --- Test Case 1: Request bytes 5-9 ---
@@ -1320,6 +1321,35 @@ mod tests {
 
             let bytes_3 = resp_range_3.collect().await.unwrap().to_bytes();
             assert_eq!(bytes_3, "tent");
+        }
+
+        #[tokio::test]
+        async fn test_file_download_head() {
+            let (_temp_dir, state) = setup_test_env().await;
+
+            let app = Router::new()
+                .route("/get_file", axum::routing::head(file_download_handler))
+                .with_state(state);
+
+            let req = Request::builder()
+                .uri("/get_file?path=test_file.txt")
+                .method("HEAD")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("Content-Length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "12"
+            );
+            let bytes = resp.collect().await.unwrap().to_bytes();
+            assert!(bytes.is_empty());
         }
     }
 
@@ -1755,7 +1785,7 @@ mod tests {
             std::os::windows::fs::symlink_file("..\\secret.txt", &malicious_symlink).unwrap();
 
             let mut app = Router::new()
-                .route("/get_file", axum::routing::get(read_file_buffer_handler))
+                .route("/get_file", axum::routing::get(file_download_handler))
                 .with_state(state);
 
             // Test valid symlink
