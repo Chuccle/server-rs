@@ -27,6 +27,7 @@ pub mod metadata {
         sub_dirs: DirEntMetaEntries,
         // Fast lookup
         file_map: std::collections::HashMap<String, usize>, // Maps filename -> index in files
+        sub_dir_map: std::collections::HashMap<String, usize>, // Maps sub_dirs -> index in sub_dirs
     }
 
     impl DirectoryLookupContext {
@@ -35,6 +36,7 @@ pub mod metadata {
                 files: DirEntMetaEntries::new(),
                 sub_dirs: DirEntMetaEntries::new(),
                 file_map: std::collections::HashMap::new(),
+                sub_dir_map: std::collections::HashMap::new(),
             }
         }
 
@@ -67,6 +69,8 @@ pub mod metadata {
         }
 
         pub fn add_subdir(&mut self, metadata: &std::fs::Metadata, name: &str) {
+            let idx = self.sub_dirs.names.len();
+            self.sub_dir_map.insert(name.to_owned(), idx);
             self.sub_dirs.names.push(name.to_owned());
             self.sub_dirs.sizes.push(metadata.len());
             self.sub_dirs.created_times.push(
@@ -147,34 +151,43 @@ pub mod metadata {
             builder.finished_data().to_owned()
         }
 
-        fn create_entry_metadata<'a>(
-            &self,
+        #[inline]
+        fn create_dir_entry_flatbuffer<'a>(
             builder: &mut flatbuffers::FlatBufferBuilder<'a>,
             idx: usize,
+            source_entries: &DirEntMetaEntries,
+            is_directory_entry: bool,
         ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntryMetadata<'a>>
         {
-            crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
-                builder,
-                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-                    size: self.files.sizes[idx],
-                    created: self.files.created_times[idx],
-                    modified: self.files.modified_times[idx],
-                    accessed: self.files.access_times[idx],
-                },
-            )
+            let args = crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
+                size: source_entries.sizes[idx],
+                created: source_entries.created_times[idx],
+                modified: source_entries.modified_times[idx],
+                accessed: source_entries.access_times[idx],
+                directory: is_directory_entry,
+            };
+            crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(builder, &args)
         }
 
-        pub fn get_file_entry_serialized(&self, name: &str) -> Option<Vec<u8>> {
-            self.file_map.get(name).map(|&index| {
-                let capacity = Self::estimate_serialized_size(1);
+        #[inline]
+        pub fn get_dir_entry_serialized(&self, name: &str, is_directory: bool) -> Option<Vec<u8>> {
+            let (source, index_option) = if is_directory {
+                (&self.sub_dirs, self.sub_dir_map.get(name).copied())
+            } else {
+                (&self.files, self.file_map.get(name).copied())
+            };
 
+            index_option.map(|index| {
+                let capacity = Self::estimate_serialized_size(1);
                 let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity as usize);
-                let file = self.create_entry_metadata(&mut builder, index);
-                builder.finish(file, None);
+                let dir_entry =
+                    Self::create_dir_entry_flatbuffer(&mut builder, index, source, is_directory);
+                builder.finish(dir_entry, None);
                 builder.finished_data().to_vec()
             })
         }
 
+        #[inline]
         fn estimate_serialized_size(count: usize) -> u64 {
             (std::mem::size_of::<DirEntMetaEntries>() as u64
                 + crate::utils::windows::file::WINDOWS_MAX_PATH)

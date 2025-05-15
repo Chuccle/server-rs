@@ -150,6 +150,7 @@ fn create_buffer_serialized(metadata: &std::fs::Metadata) -> Result<Vec<u8>, App
             created: created_secs,
             modified: modified_secs,
             accessed: accessed_secs,
+            directory: metadata.is_dir(),
         },
     );
 
@@ -178,7 +179,7 @@ fn validate_path(
     )
 }
 
-async fn get_file_info_handler(
+async fn get_dir_entry_info_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<PathQuery>,
 ) -> Result<Vec<u8>, AppError> {
@@ -186,11 +187,6 @@ async fn get_file_info_handler(
 
     let normalized_requested = validate_path(&data.base_path, &params.path)?;
     log_trace!("Validated canonical path: {:?}", &normalized_requested);
-
-    if !normalized_requested.is_file() {
-        log_debug!("Path is not a file: {:?}", &normalized_requested);
-        return Err(AppError::NotFound);
-    }
 
     let parent_dir = normalized_requested.parent().ok_or_else(|| {
         log_warn!("Invalid file path structure: {:?}", &normalized_requested);
@@ -226,7 +222,12 @@ async fn get_file_info_handler(
                 .ok_or(AppError::InvalidPathEncoding)?;
 
             return cached_meta
-                .get_file_entry_serialized(file_name)
+                .get_dir_entry_serialized(
+                    file_name,
+                    tokio::fs::symlink_metadata(&normalized_requested)
+                        .await?
+                        .is_dir(),
+                )
                 .ok_or(AppError::Internal);
         }
 
@@ -489,7 +490,10 @@ async fn main() -> std::io::Result<()> {
     }
 
     let app = axum::Router::new()
-        .route("/get_file_info", axum::routing::get(get_file_info_handler))
+        .route(
+            "/get_dir_entry_info",
+            axum::routing::get(get_dir_entry_info_handler),
+        )
         .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
         .route("/get_file", axum::routing::get(file_download_handler))
         .route("/get_file", axum::routing::head(file_download_handler))
@@ -650,7 +654,10 @@ mod tests {
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state);
 
             // Test directory listing
@@ -666,7 +673,7 @@ mod tests {
 
             // Test file info
             let req = Request::builder()
-                .uri("/get_file_info?path=timestamp_test/test_file.txt")
+                .uri("/get_dir_entry_info?path=timestamp_test/test_file.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -676,7 +683,8 @@ mod tests {
             let fb_file: DirectoryEntryMetadata =
                 flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
-            // Verify file timestamps from get_file_info
+            assert!(!fb_file.directory());
+            // Verify file timestamps from get_dir_entry_info
             let file_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
                 file_meta.created().unwrap(),
             );
@@ -766,7 +774,7 @@ mod tests {
         }
     }
 
-    mod file_info {
+    mod dir_entry_info {
         use super::*;
 
         #[tokio::test]
@@ -774,11 +782,14 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state);
 
             let req = Request::builder()
-                .uri("/get_file_info?path=test_file.txt")
+                .uri("/get_dir_entry_info?path=test_file.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -799,11 +810,14 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state);
 
             let req = Request::builder()
-                .uri("/get_file_info?path=nonexistent.txt")
+                .uri("/get_dir_entry_info?path=nonexistent.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -824,11 +838,14 @@ mod tests {
             File::create(path.join("deep_file.txt")).unwrap();
 
             let app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state);
 
             let req = Request::builder()
-        .uri("/get_file_info?path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
+        .uri("/get_dir_entry_info?path=level_0/level_1/level_2/level_3/level_4/level_5/level_6/level_7/level_8/level_9/deep_file.txt")
         .method("GET")
         .body(Body::empty())
         .unwrap();
@@ -860,12 +877,15 @@ mod tests {
             );
 
             let mut app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state.clone());
 
             // Initial request to populate cache
             let req = Request::builder()
-                .uri("/get_file_info?path=modifiable.txt")
+                .uri("/get_dir_entry_info?path=modifiable.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -880,6 +900,7 @@ mod tests {
             assert_eq!(fb_data.created(), created_secs);
             assert_eq!(fb_data.modified(), modified_secs);
             assert_eq!(fb_data.accessed(), accessed_secs);
+            assert!(!fb_data.directory());
 
             // Modify the file
             File::create(&file_path)
@@ -895,7 +916,7 @@ mod tests {
 
             // Subsequent request should fetch fresh data
             let req = Request::builder()
-                .uri("/get_file_info?path=modifiable.txt")
+                .uri("/get_dir_entry_info?path=modifiable.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -908,6 +929,53 @@ mod tests {
 
             assert_eq!(fb_data.size(), 7);
             assert_eq!(fb_data.created(), created_secs);
+        }
+
+        #[tokio::test]
+        async fn test_folder_and_data_changes() {
+            let (temp_dir, state) = setup_test_env().await;
+            let directory_path = temp_dir.join("test_dir");
+
+            // obtain file metadata like creation time
+            let metadata = fs::metadata(&directory_path).unwrap();
+
+            let created_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+                metadata.created().unwrap(),
+            );
+
+            let modified_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+                metadata.modified().unwrap(),
+            );
+
+            let accessed_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
+                metadata.accessed().unwrap(),
+            );
+
+            let mut app = Router::new()
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
+                .with_state(state.clone());
+
+            // Initial request to populate cache
+            let req = Request::builder()
+                .uri("/get_dir_entry_info?path=test_dir")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.call(req).await.unwrap();
+
+            let bytes = resp.collect().await.unwrap().to_bytes();
+
+            let fb_data: DirectoryEntryMetadata =
+                flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
+
+            assert_eq!(fb_data.size(), metadata.len());
+            assert_eq!(fb_data.created(), created_secs);
+            assert_eq!(fb_data.modified(), modified_secs);
+            assert_eq!(fb_data.accessed(), accessed_secs);
+            assert!(fb_data.directory());
         }
     }
 
@@ -1433,12 +1501,15 @@ mod tests {
             File::create(&file_path).unwrap().write_all(b"v1").unwrap();
 
             let mut app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state.clone());
 
             // Initial request to populate cache
             let req = Request::builder()
-                .uri("/get_file_info?path=modifiable.txt")
+                .uri("/get_dir_entry_info?path=modifiable.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -1466,7 +1537,7 @@ mod tests {
 
             // Subsequent request should fetch fresh data
             let req = Request::builder()
-                .uri("/get_file_info?path=modifiable.txt")
+                .uri("/get_dir_entry_info?path=modifiable.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
@@ -1489,13 +1560,16 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let mut app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
                 .with_state(state);
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=../passwd.txt")
+                    .uri("/get_dir_entry_info?path=../passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
@@ -1507,7 +1581,7 @@ mod tests {
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=/../passwd.txt")
+                    .uri("/get_dir_entry_info?path=/../passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
@@ -1519,7 +1593,7 @@ mod tests {
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=test_dir/../../passwd.txt")
+                    .uri("/get_dir_entry_info?path=test_dir/../../passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
@@ -1607,13 +1681,16 @@ mod tests {
             let (_temp_dir, state) = setup_test_env().await;
 
             let mut app = Router::new()
-                .route("/get_file_info", axum::routing::get(get_file_info_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
                 .with_state(state);
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=..\\passwd.txt")
+                    .uri("/get_dir_entry_info?path=..\\passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
@@ -1625,7 +1702,7 @@ mod tests {
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=\\..\\passwd.txt")
+                    .uri("/get_dir_entry_info?path=\\..\\passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
@@ -1637,7 +1714,7 @@ mod tests {
 
             {
                 let req = Request::builder()
-                    .uri("/get_file_info?path=test_dir\\..\\..\\passwd.txt")
+                    .uri("/get_dir_entry_info?path=test_dir\\..\\..\\passwd.txt")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap();
