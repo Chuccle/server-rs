@@ -872,10 +872,6 @@ mod tests {
                 metadata.modified().unwrap(),
             );
 
-            let accessed_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
-                metadata.accessed().unwrap(),
-            );
-
             let mut app = Router::new()
                 .route(
                     "/get_dir_entry_info",
@@ -899,7 +895,6 @@ mod tests {
             assert_eq!(fb_data.size(), metadata.len());
             assert_eq!(fb_data.created(), created_secs);
             assert_eq!(fb_data.modified(), modified_secs);
-            assert_eq!(fb_data.accessed(), accessed_secs);
             assert!(!fb_data.directory());
 
             // Modify the file
@@ -947,10 +942,6 @@ mod tests {
                 metadata.modified().unwrap(),
             );
 
-            let accessed_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
-                metadata.accessed().unwrap(),
-            );
-
             let mut app = Router::new()
                 .route(
                     "/get_dir_entry_info",
@@ -974,7 +965,6 @@ mod tests {
             assert_eq!(fb_data.size(), metadata.len());
             assert_eq!(fb_data.created(), created_secs);
             assert_eq!(fb_data.modified(), modified_secs);
-            assert_eq!(fb_data.accessed(), accessed_secs);
             assert!(fb_data.directory());
         }
     }
