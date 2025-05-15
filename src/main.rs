@@ -185,11 +185,16 @@ async fn get_dir_entry_info_handler(
 ) -> Result<Vec<u8>, AppError> {
     log_info!("[FILE INFO] Handling request for: {}", &params.path);
 
-    let normalized_requested = validate_path(&data.base_path, &params.path)?;
-    log_trace!("Validated canonical path: {:?}", &normalized_requested);
+    let canonicalized_path =
+        tokio::fs::canonicalize(&validate_path(&data.base_path, &params.path)?).await?;
+    log_trace!("Validated canonical path: {:?}", &canonicalized_path);
 
-    let parent_dir = normalized_requested.parent().ok_or_else(|| {
-        log_warn!("Invalid file path structure: {:?}", &normalized_requested);
+    if !canonicalized_path.starts_with(&data.base_path) {
+        return Err(AppError::PathTraversal);
+    }
+
+    let parent_dir = canonicalized_path.parent().ok_or_else(|| {
+        log_warn!("Invalid file path structure: {:?}", &canonicalized_path);
         AppError::InvalidPath
     })?;
 
@@ -215,7 +220,7 @@ async fn get_dir_entry_info_handler(
             data.cache_stats.increment_hits();
             log_debug!("Cache hit for directory: {:?}", parent_dir);
 
-            let file_name = normalized_requested
+            let file_name = canonicalized_path
                 .file_name()
                 .ok_or(AppError::InvalidPath)?
                 .to_str()
@@ -224,9 +229,7 @@ async fn get_dir_entry_info_handler(
             return cached_meta
                 .get_dir_entry_serialized(
                     file_name,
-                    tokio::fs::symlink_metadata(&normalized_requested)
-                        .await?
-                        .is_dir(),
+                    tokio::fs::metadata(&canonicalized_path).await?.is_dir(),
                 )
                 .ok_or(AppError::Internal);
         }
@@ -234,14 +237,14 @@ async fn get_dir_entry_info_handler(
         log_debug!("Cache entry expired for: {:?}", &parent_dir);
         _ = data
             .meta_cache
-            .remove_if_async(&normalized_requested, |entry| entry.1 == timestamp)
+            .remove_if_async(&canonicalized_path, |entry| entry.1 == timestamp)
             .await;
     }
 
     data.cache_stats.increment_misses();
 
-    log_info!("Fetching fresh metadata for: {:?}", &normalized_requested);
-    let meta = tokio::fs::symlink_metadata(&normalized_requested).await?;
+    log_info!("Fetching fresh metadata for: {:?}", &canonicalized_path);
+    let meta = tokio::fs::metadata(&canonicalized_path).await?;
 
     let file_entry = create_buffer_serialized(&meta).map_err(|e| {
         log_error_with_context!(e, "Failed to create directory entry");
@@ -315,7 +318,7 @@ async fn get_dir_info_handler(
         return Err(AppError::PathTraversal);
     }
 
-    if !canonicalized_path.is_dir() {
+    if !tokio::fs::metadata(&canonicalized_path).await?.is_dir() {
         log_debug!("Path is not a directory: {:?}", &canonicalized_path);
         return Err(AppError::NotFound);
     }
@@ -414,7 +417,7 @@ async fn find_path_handler(
         return Err(AppError::PathTraversal);
     }
 
-    match canonicalized_path.is_dir() {
+    match tokio::fs::metadata(canonicalized_path).await?.is_dir() {
         true => Ok((axum::http::StatusCode::FOUND, "1")),
         false => Ok((axum::http::StatusCode::FOUND, "0")),
     }
@@ -1853,6 +1856,10 @@ mod tests {
 
             let mut app = Router::new()
                 .route("/get_file", axum::routing::get(file_download_handler))
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
                 .with_state(state);
 
             // Test valid symlink
@@ -1870,6 +1877,24 @@ mod tests {
             // Test malicious symlink
             let req = Request::builder()
                 .uri("/get_file?path=malicious_link.txt")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+            // Test valid symlink
+            let req = Request::builder()
+                .uri("/get_dir_entry_info?path=valid_link.txt")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            // Test malicious symlink
+            let req = Request::builder()
+                .uri("/get_dir_entry_info?path=malicious_link.txt")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
