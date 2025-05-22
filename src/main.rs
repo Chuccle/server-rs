@@ -838,6 +838,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_valid_file_case_sensitivity_info() {
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
+
+            let app = Router::new()
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
+                .with_state(state);
+
+            let req = Request::builder()
+                .uri("/get_dir_entry_info?path=Test_File.txt")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            let bytes = resp.collect().await.unwrap().to_bytes();
+            // Parse FlatBuffer data
+            let fb_data: DirectoryEntryMetadata =
+                flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
+
+            assert_eq!(fb_data.size(), 12);
+        }
+
+        #[tokio::test]
         async fn test_nonexistent_file_info() {
             let temp = tempfile::tempdir().unwrap();
 
