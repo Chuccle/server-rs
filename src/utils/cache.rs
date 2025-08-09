@@ -1,197 +1,269 @@
 pub mod metadata {
 
-    #[derive(Debug, Clone)]
-    pub struct DirEntMetaEntries {
-        names: Vec<String>,
-        sizes: Vec<u64>,
-        created_times: Vec<u64>,
-        modified_times: Vec<u64>,
-        access_times: Vec<u64>,
+    #[derive(Debug, Clone, Copy)]
+    pub struct FileEntry {
+        size: u64,
+        created: u64,
+        modified: u64,
+        accessed: u64,
     }
-    impl DirEntMetaEntries {
-        pub fn new() -> Self {
+
+    impl FileEntry {
+        #[inline]
+        fn new(metadata: &std::fs::Metadata) -> Self {
             Self {
-                names: Vec::new(),
-                sizes: Vec::new(),
-                created_times: Vec::new(),
-                modified_times: Vec::new(),
-                access_times: Vec::new(),
+                size: metadata.len(),
+                created: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .created()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+                modified: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+                accessed: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .accessed()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
             }
         }
+
+        #[inline]
+        fn to_meta_times(self) -> crate::generated::blorg_meta_flat::MetaTimes {
+            crate::generated::blorg_meta_flat::MetaTimes::new(
+                self.created,
+                self.modified,
+                self.accessed,
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct SubdirectoryEntry {
+        created: u64,
+        modified: u64,
+        accessed: u64,
+    }
+
+    impl SubdirectoryEntry {
+        #[inline]
+        fn new(metadata: &std::fs::Metadata) -> Self {
+            Self {
+                created: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .created()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+                modified: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+                accessed: crate::utils::windows::time::IntoFileTime::into_file_time(
+                    metadata
+                        .accessed()
+                        .unwrap_or_else(|_| std::time::SystemTime::now()),
+                ),
+            }
+        }
+
+        #[inline]
+        fn to_meta_times(self) -> crate::generated::blorg_meta_flat::MetaTimes {
+            crate::generated::blorg_meta_flat::MetaTimes::new(
+                self.created,
+                self.modified,
+                self.accessed,
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum EntryType {
+        File(FileEntry),
+        Directory(SubdirectoryEntry),
     }
 
     #[derive(Debug, Clone)]
     pub struct DirectoryLookupContext {
-        // Contiguous storage for cache efficiency
-        files: DirEntMetaEntries,
-        sub_dirs: DirEntMetaEntries,
-        // Fast lookup
-        file_map: std::collections::HashMap<String, usize>, // Maps filename -> index in files
-        sub_dir_map: std::collections::HashMap<String, usize>, // Maps sub_dirs -> index in sub_dirs
+        files: Vec<FileEntry>,
+        file_names: Vec<String>,
+        sub_dirs: Vec<SubdirectoryEntry>,
+        sub_dir_names: Vec<String>,
+        name_to_entry: std::collections::HashMap<String, (bool, usize)>,
     }
 
     impl DirectoryLookupContext {
         pub fn new() -> Self {
             Self {
-                files: DirEntMetaEntries::new(),
-                sub_dirs: DirEntMetaEntries::new(),
-                file_map: std::collections::HashMap::new(),
-                sub_dir_map: std::collections::HashMap::new(),
+                files: Vec::new(),
+                file_names: Vec::new(),
+                sub_dirs: Vec::new(),
+                sub_dir_names: Vec::new(),
+                name_to_entry: std::collections::HashMap::new(),
             }
         }
 
+        #[inline]
         pub fn add_file(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let idx = self.files.names.len();
-            self.file_map.insert(name.to_owned(), idx);
-            self.files.names.push(name.to_owned());
-            self.files.sizes.push(metadata.len());
-            self.files.created_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .created()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
-            self.files.modified_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .modified()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
-            self.files.access_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .accessed()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
+            let idx = self.files.len();
+            let entry = FileEntry::new(metadata);
+
+            self.files.push(entry);
+            self.file_names.push(name.to_owned());
+            self.name_to_entry.insert(name.to_owned(), (false, idx));
         }
 
+        #[inline]
         pub fn add_subdir(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let idx = self.sub_dirs.names.len();
-            self.sub_dir_map.insert(name.to_owned(), idx);
-            self.sub_dirs.names.push(name.to_owned());
-            self.sub_dirs.sizes.push(metadata.len());
-            self.sub_dirs.created_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .created()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
-            self.sub_dirs.modified_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .modified()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
-            self.sub_dirs.access_times.push(
-                crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .accessed()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            );
+            let idx = self.sub_dirs.len();
+            let entry = SubdirectoryEntry::new(metadata);
+
+            self.sub_dirs.push(entry);
+            self.sub_dir_names.push(name.to_owned());
+            self.name_to_entry.insert(name.to_owned(), (true, idx));
         }
 
-        fn create_entries_metadata<'a>(
-            &self,
-            builder: &mut flatbuffers::FlatBufferBuilder<'a>,
-            entries: &DirEntMetaEntries,
-        ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntriesMetadata<'a>>
+        pub fn add_entries_batch<I>(&mut self, entries: I)
+        where
+            I: IntoIterator<Item = (std::fs::Metadata, String, bool)>,
         {
-            // First create all string objects
-            let names: Vec<flatbuffers::WIPOffset<_>> = entries
-                .names
-                .iter()
-                .map(|name| builder.create_string(name))
-                .collect();
+            let entries_iter = entries.into_iter();
 
-            let names_vector = builder.create_vector(&names);
-            let sizes_vector = builder.create_vector(&entries.sizes);
-            let created_vector = builder.create_vector(&entries.created_times);
-            let modified_vector = builder.create_vector(&entries.modified_times);
-            let accessed_vector = builder.create_vector(&entries.access_times);
+            // Pre-allocate if we have size hints
+            if let (lower, Some(_upper)) = entries_iter.size_hint() {
+                let estimated_files = lower / 2; // rough estimate
+                let estimated_dirs = lower - estimated_files;
 
-            crate::generated::blorg_meta_flat::DirectoryEntriesMetadata::create(
-                builder,
-                &crate::generated::blorg_meta_flat::DirectoryEntriesMetadataArgs {
-                    name: Some(names_vector),
-                    size: Some(sizes_vector),
-                    created: Some(created_vector),
-                    modified: Some(modified_vector),
-                    accessed: Some(accessed_vector),
-                },
-            )
+                self.files.reserve(estimated_files);
+                self.file_names.reserve(estimated_files);
+                self.sub_dirs.reserve(estimated_dirs);
+                self.sub_dir_names.reserve(estimated_dirs);
+                self.name_to_entry.reserve(lower);
+            }
+
+            for (metadata, name, is_directory) in entries_iter {
+                if is_directory {
+                    self.add_subdir(&metadata, &name);
+                } else {
+                    self.add_file(&metadata, &name);
+                }
+            }
+        }
+
+        #[inline]
+        pub fn get_entry(&self, name: &str) -> Option<(&str, EntryType)> {
+            let &(is_dir, idx) = self.name_to_entry.get(name)?;
+
+            if is_dir {
+                let entry = self.sub_dirs.get(idx)?;
+                let name = self.sub_dir_names.get(idx)?;
+                Some((name, EntryType::Directory(*entry)))
+            } else {
+                let entry = self.files.get(idx)?;
+                let name = self.file_names.get(idx)?;
+                Some((name, EntryType::File(*entry)))
+            }
         }
 
         pub fn get_all_entries_serialized(&self) -> Vec<u8> {
-            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(
-                Self::estimate_serialized_size(self.files.names.len() + self.sub_dirs.names.len())
-                    as usize,
-            );
+            let file_count = self.files.len();
+            let dir_count = self.sub_dirs.len();
+            let capacity = Self::estimate_serialized_size(file_count + dir_count) as usize;
 
-            let directories = self.create_entries_metadata(&mut builder, &self.sub_dirs);
+            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
 
-            let files = self.create_entries_metadata(&mut builder, &self.files);
+            let dir_metadata: Vec<_> = self
+                .sub_dirs
+                .iter()
+                .zip(self.sub_dir_names.iter())
+                .map(|(entry, name)| {
+                    let times = entry.to_meta_times();
+                    let name_fb = builder.create_string(name);
+                    crate::generated::blorg_meta_flat::SubdirectoryMetadata::create(
+                        &mut builder,
+                        &crate::generated::blorg_meta_flat::SubdirectoryMetadataArgs {
+                            name: Some(name_fb),
+                            times: Some(&times),
+                        },
+                    )
+                })
+                .collect();
+
+            let file_metadata: Vec<_> = self
+                .files
+                .iter()
+                .zip(self.file_names.iter())
+                .map(|(entry, name)| {
+                    let times = entry.to_meta_times();
+                    let name_fb = builder.create_string(name);
+                    crate::generated::blorg_meta_flat::FileEntryMetadata::create(
+                        &mut builder,
+                        &crate::generated::blorg_meta_flat::FileEntryMetadataArgs {
+                            name: Some(name_fb),
+                            size: entry.size,
+                            times: Some(&times),
+                        },
+                    )
+                })
+                .collect();
+
+            let directories_vector = builder.create_vector(&dir_metadata);
+            let files_vector = builder.create_vector(&file_metadata);
 
             let directory = crate::generated::blorg_meta_flat::Directory::create(
                 &mut builder,
                 &crate::generated::blorg_meta_flat::DirectoryArgs {
-                    directory_count: self.sub_dirs.names.len() as u64,
-                    file_count: self.files.names.len() as u64,
-                    directories: Some(directories),
-                    files: Some(files),
+                    subdirectories: Some(directories_vector),
+                    files: Some(files_vector),
                 },
             );
 
             builder.finish(directory, None);
-            builder.finished_data().to_owned()
+            builder.finished_data().to_vec()
         }
 
         #[inline]
-        fn create_dir_entry_flatbuffer<'a>(
-            builder: &mut flatbuffers::FlatBufferBuilder<'a>,
-            idx: usize,
-            source_entries: &DirEntMetaEntries,
-            is_directory_entry: bool,
-        ) -> flatbuffers::WIPOffset<crate::generated::blorg_meta_flat::DirectoryEntryMetadata<'a>>
-        {
-            let args = crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-                size: source_entries.sizes[idx],
-                created: source_entries.created_times[idx],
-                modified: source_entries.modified_times[idx],
-                accessed: source_entries.access_times[idx],
-                directory: is_directory_entry,
-            };
-            crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(builder, &args)
-        }
+        pub fn get_dir_entry_serialized(&self, name: &str) -> Option<Vec<u8>> {
+            let (_name, entry) = self.get_entry(name)?;
 
-        #[inline]
-        pub fn get_dir_entry_serialized(&self, name: &str, is_directory: bool) -> Option<Vec<u8>> {
-            let (source, index_option) = if is_directory {
-                (&self.sub_dirs, self.sub_dir_map.get(name).copied())
-            } else {
-                (&self.files, self.file_map.get(name).copied())
+            let capacity = Self::estimate_single_entry_size();
+            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
+
+            let (size, created, modified, accessed, is_directory) = match entry {
+                EntryType::File(f) => (f.size, f.created, f.modified, f.accessed, false),
+                EntryType::Directory(d) => (0, d.created, d.modified, d.accessed, true),
             };
 
-            index_option.map(|index| {
-                let capacity = Self::estimate_serialized_size(1);
-                let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity as usize);
-                let dir_entry =
-                    Self::create_dir_entry_flatbuffer(&mut builder, index, source, is_directory);
-                builder.finish(dir_entry, None);
-                builder.finished_data().to_vec()
-            })
+            let dir_entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
+                &mut builder,
+                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
+                    size,
+                    created,
+                    modified,
+                    accessed,
+                    directory: is_directory,
+                },
+            );
+
+            builder.finish(dir_entry, None);
+            Some(builder.finished_data().to_vec())
         }
 
         #[inline]
         fn estimate_serialized_size(count: usize) -> u64 {
-            (std::mem::size_of::<DirEntMetaEntries>() as u64
-                + crate::utils::windows::file::WINDOWS_MAX_PATH)
-                * count as u64
+            const FLATBUFFER_OVERHEAD: u64 = 128;
+            const METADATA_SIZE: u64 = 64;
+
+            (METADATA_SIZE + crate::utils::windows::file::WINDOWS_MAX_PATH) * count as u64
+                + FLATBUFFER_OVERHEAD
+        }
+
+        #[inline]
+        fn estimate_single_entry_size() -> usize {
+            128
         }
     }
 
