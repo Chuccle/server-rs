@@ -227,10 +227,7 @@ async fn get_dir_entry_info_handler(
                 .ok_or(AppError::InvalidPathEncoding)?;
 
             return cached_meta
-                .get_dir_entry_serialized(
-                    file_name,
-                    tokio::fs::metadata(&canonicalized_path).await?.is_dir(),
-                )
+                .get_dir_entry_serialized(file_name)
                 .ok_or(AppError::Internal);
         }
 
@@ -268,34 +265,40 @@ async fn create_meta_cache_entry(
                 e
             })?;
 
-            for entry_result in dir {
-                match entry_result {
+            let entries: Vec<(std::fs::Metadata, String, bool)> = dir
+                .filter_map(|entry_result| match entry_result {
                     Ok(entry) => {
                         log_trace!("Processing entry: {:?}", entry.path());
 
-                        let Ok(name) = entry.file_name().into_string() else {
-                            log_debug!("Invalid filename encoding: {:?}", &entry.path());
-                            continue;
+                        let name = match entry.file_name().into_string() {
+                            Ok(name) => name,
+                            Err(_) => {
+                                log_debug!("Invalid filename encoding: {:?}", &entry.path());
+                                return None;
+                            }
                         };
 
                         match entry.metadata() {
                             Ok(metadata) => {
-                                if metadata.is_dir() {
-                                    cache_entry.add_subdir(&metadata, &name);
-                                } else {
-                                    cache_entry.add_file(&metadata, &name);
-                                }
+                                let is_directory = metadata.is_dir();
+                                Some((metadata, name, is_directory))
                             }
                             Err(e) => {
                                 log_warn_with_context!(e, "Failed to get metadata for {}", &name);
+                                None
                             }
                         }
                     }
                     Err(e) => {
                         log_debug_with_context!(e, "Error reading directory entry");
+                        None
                     }
-                }
-            }
+                })
+                .collect();
+
+            // Batch add all entries at once
+            cache_entry.add_entries_batch(entries);
+
             log_info!("Directory scan complete - Path: {:?}", &path);
 
             Ok(cache_entry)
@@ -509,7 +512,7 @@ async fn main() -> std::io::Result<()> {
 
     // Start server
     log_info!("Starting server on port {} serving path: {:?}", port, &path);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -592,13 +595,11 @@ mod tests {
     use http_body_util::BodyExt;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use tower::{Service, util::ServiceExt};
 
     // Test setup helper
-    async fn setup_test_env() -> (PathBuf, Arc<AppState>) {
-        let base_dir = tempfile::tempdir().unwrap().into_path();
+    async fn setup_test_env(base_dir: &std::path::Path) -> Arc<AppState> {
         // Create test files
         fs::create_dir(base_dir.join("test_dir")).unwrap();
         File::create(base_dir.join("test_file.txt"))
@@ -618,16 +619,16 @@ mod tests {
 
         let state = std::sync::Arc::new(AppState {
             meta_cache: scc::HashCache::with_capacity(1000, 20000),
-            base_path: base_dir.clone(),
+            base_path: base_dir.to_path_buf(),
             cache_stats: utils::stats::Cache::new(),
         });
 
-        if let Err(e) = start_fs_watcher(base_dir.clone(), state.clone()) {
+        if let Err(e) = start_fs_watcher(base_dir.to_path_buf(), state.clone()) {
             log_error_with_context!(e, "Failed to create file watcher");
             std::process::exit(1);
         }
 
-        (base_dir, state)
+        state
     }
 
     mod misc {
@@ -635,10 +636,14 @@ mod tests {
 
         #[tokio::test]
         async fn test_timestamps_consistency() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             // Create a directory with one subdirectory
-            let parent_dir = _temp_dir.join("timestamp_test");
+            let parent_dir = temp_dir.join("timestamp_test");
             fs::create_dir(&parent_dir).unwrap();
 
             let sub_dir = parent_dir.join("subdirectory");
@@ -683,10 +688,8 @@ mod tests {
             let resp = app.call(req).await.unwrap();
 
             let bytes = resp.collect().await.unwrap().to_bytes();
-            let fb_file: DirectoryEntryMetadata =
-                flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
+            let fb_file = flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
-            assert!(!fb_file.directory());
             // Verify file timestamps from get_dir_entry_info
             let file_created_expected = crate::utils::windows::time::IntoFileTime::into_file_time(
                 file_meta.created().unwrap(),
@@ -699,19 +702,32 @@ mod tests {
             assert_eq!(fb_file.modified(), file_modified_expected);
 
             // Find file in directory listing
-            let file_names = fb_dir.files().unwrap().name().unwrap();
-            let file_index = file_names
+            let file_index = fb_dir
+                .files()
+                .unwrap()
                 .iter()
-                .position(|n| n == "test_file.txt")
+                .position(|n| n.name().unwrap() == "test_file.txt")
                 .unwrap();
 
             // Verify file timestamps from directory listing
             assert_eq!(
-                fb_dir.files().unwrap().created().unwrap().get(file_index),
+                fb_dir
+                    .files()
+                    .unwrap()
+                    .get(file_index)
+                    .times()
+                    .unwrap()
+                    .created(),
                 file_created_expected
             );
             assert_eq!(
-                fb_dir.files().unwrap().modified().unwrap().get(file_index),
+                fb_dir
+                    .files()
+                    .unwrap()
+                    .get(file_index)
+                    .times()
+                    .unwrap()
+                    .modified(),
                 file_modified_expected
             );
 
@@ -724,33 +740,42 @@ mod tests {
                     subdir_meta.modified().unwrap(),
                 );
 
-            let dir_names = fb_dir.directories().unwrap().name().unwrap();
-            let dir_index = dir_names.iter().position(|n| n == "subdirectory").unwrap();
+            let dir_index = fb_dir
+                .subdirectories()
+                .unwrap()
+                .iter()
+                .position(|n| n.name().unwrap() == "subdirectory")
+                .unwrap();
 
             assert_eq!(
                 fb_dir
-                    .directories()
+                    .subdirectories()
                     .unwrap()
-                    .created()
+                    .get(dir_index)
+                    .times()
                     .unwrap()
-                    .get(dir_index),
+                    .created(),
                 subdir_created_expected
             );
             assert_eq!(
                 fb_dir
-                    .directories()
+                    .subdirectories()
                     .unwrap()
-                    .modified()
+                    .get(dir_index)
+                    .times()
                     .unwrap()
-                    .get(dir_index),
+                    .modified(),
                 subdir_modified_expected
             );
         }
 
         #[tokio::test]
         async fn test_concurrent_cache_access() {
-            // needs some code
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -782,7 +807,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_valid_file_info() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route(
@@ -810,7 +839,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_nonexistent_file_info() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route(
@@ -832,10 +865,14 @@ mod tests {
 
         #[tokio::test]
         async fn test_deep_nested_directories() {
-            let (temp_dir, state) = setup_test_env().await;
-            let mut path = temp_dir.clone();
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
+            let mut path = temp_dir.to_path_buf();
             for depth in 0..10 {
-                path = path.join(format!("level_{}", depth));
+                path = path.join(format!("level_{depth}"));
                 fs::create_dir(&path).unwrap();
             }
             File::create(path.join("deep_file.txt")).unwrap();
@@ -860,7 +897,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_file_and_data_changes() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
             let file_path = temp_dir.join("modifiable.txt");
             File::create(&file_path).unwrap().write_all(b"v1").unwrap();
 
@@ -907,7 +948,7 @@ mod tests {
                 .unwrap();
 
             // Fast-forward time beyond TTL
-            if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
+            if let Some(mut foo) = state.meta_cache.get_async(temp_dir).await {
                 let bar = foo.get_mut();
                 bar.1 -= tokio::time::Duration::from_secs(CACHE_TTL_SECONDS); // Set timestamp to simulate expiration
             }
@@ -931,7 +972,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_folder_and_data_changes() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
             let directory_path = temp_dir.join("test_dir");
 
             // obtain file metadata like creation time
@@ -977,7 +1022,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_directory_info() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -998,28 +1047,26 @@ mod tests {
             // Parse FlatBuffer data
             let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
-            let directory_count = fb_data.directory_count();
-            let file_count = fb_data.file_count();
+            let directory_count = fb_data.subdirectories().unwrap().len();
+            let file_count = fb_data.files().unwrap().len();
+
+            assert_eq!(directory_count, 1);
+
+            assert_eq!(file_count, 1);
 
             assert_eq!(
-                fb_data.directories().unwrap().name().unwrap().len() as u64,
-                directory_count
-            );
-
-            assert_eq!(
-                fb_data.files().unwrap().name().unwrap().len() as u64,
-                file_count
-            );
-
-            assert_eq!(
-                fb_data.files().unwrap().name().unwrap().get(0),
+                fb_data.files().unwrap().get(0).name().unwrap(),
                 "file_in_dir.txt"
             );
         }
 
         #[tokio::test]
         async fn test_special_char_filenames() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
             let file_names = vec!["файл.txt", "スペース ファイル", "😀.md"];
 
             for name in &file_names {
@@ -1041,31 +1088,35 @@ mod tests {
             let bytes = resp.collect().await.unwrap().to_bytes();
 
             let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
-            let entries = fb_data.files().unwrap().name().unwrap();
+            let entries = fb_data.files().unwrap();
 
             for name in file_names {
-                assert!(entries.iter().any(|e| e == name));
+                assert!(entries.iter().any(|e| e.name().unwrap() == name));
             }
         }
 
         #[tokio::test]
         async fn test_directory_with_mixed_contents() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             // Create directory with multiple subdirectories and files
-            let mixed_dir = _temp_dir.join("mixed_dir");
+            let mixed_dir = temp_dir.join("mixed_dir");
             fs::create_dir(&mixed_dir).unwrap();
 
             // Create subdirectories
             for i in 1..=3 {
-                fs::create_dir(mixed_dir.join(format!("subdir_{}", i))).unwrap();
+                fs::create_dir(mixed_dir.join(format!("subdir_{i}"))).unwrap();
             }
 
             // Create files
             for i in 1..=5 {
-                File::create(mixed_dir.join(format!("file_{}.txt", i)))
+                File::create(mixed_dir.join(format!("file_{i}.txt")))
                     .unwrap()
-                    .write_all(format!("content {}", i).as_bytes())
+                    .write_all(format!("content {i}").as_bytes())
                     .unwrap();
             }
 
@@ -1088,33 +1139,27 @@ mod tests {
             let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
             // Verify counts
-            assert_eq!(fb_data.directory_count(), 3);
-            assert_eq!(fb_data.file_count(), 5);
-
-            // Verify all directory info arrays have the same length
-            let dir_names = fb_data.directories().unwrap().name().unwrap();
-            assert_eq!(dir_names.len(), 3);
-            assert_eq!(fb_data.directories().unwrap().size().unwrap().len(), 3);
-            assert_eq!(fb_data.directories().unwrap().created().unwrap().len(), 3);
-            assert_eq!(fb_data.directories().unwrap().modified().unwrap().len(), 3);
-            assert_eq!(fb_data.directories().unwrap().accessed().unwrap().len(), 3);
-
-            // Verify all file info arrays have the same length
-            let file_names = fb_data.files().unwrap().name().unwrap();
-            assert_eq!(file_names.len(), 5);
-            assert_eq!(fb_data.files().unwrap().size().unwrap().len(), 5);
-            assert_eq!(fb_data.files().unwrap().created().unwrap().len(), 5);
-            assert_eq!(fb_data.files().unwrap().modified().unwrap().len(), 5);
-            assert_eq!(fb_data.files().unwrap().accessed().unwrap().len(), 5);
+            assert_eq!(fb_data.subdirectories().unwrap().len(), 3);
+            assert_eq!(fb_data.files().unwrap().len(), 5);
 
             // Verify directory names are present
-            let dir_names_set: std::collections::HashSet<&str> = dir_names.iter().collect();
+            let dir_names_set: std::collections::HashSet<&str> = fb_data
+                .subdirectories()
+                .unwrap()
+                .iter()
+                .map(|e| e.name().unwrap())
+                .collect();
             assert!(dir_names_set.contains("subdir_1"));
             assert!(dir_names_set.contains("subdir_2"));
             assert!(dir_names_set.contains("subdir_3"));
 
             // Verify file names are present
-            let file_names_set: std::collections::HashSet<&str> = file_names.iter().collect();
+            let file_names_set: std::collections::HashSet<&str> = fb_data
+                .files()
+                .unwrap()
+                .iter()
+                .map(|e| e.name().unwrap())
+                .collect();
             assert!(file_names_set.contains("file_1.txt"));
             assert!(file_names_set.contains("file_2.txt"));
             assert!(file_names_set.contains("file_3.txt"));
@@ -1124,10 +1169,14 @@ mod tests {
 
         #[tokio::test]
         async fn test_directory_metadata_fields() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             // Create nested directory structure with specific timestamps if possible
-            let nested_dir = _temp_dir.join("nested_test_dir");
+            let nested_dir = temp_dir.join("nested_test_dir");
             fs::create_dir(&nested_dir).unwrap();
 
             // Add a subdirectory to test with
@@ -1153,26 +1202,37 @@ mod tests {
             let fb_data: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
             // Verify there's one directory and no files
-            assert_eq!(fb_data.directory_count(), 1);
-            assert_eq!(fb_data.file_count(), 0);
+            assert_eq!(fb_data.subdirectories().unwrap().len(), 1);
+            assert_eq!(fb_data.files().unwrap().len(), 0);
 
             // Verify directory name
             assert_eq!(
-                fb_data.directories().unwrap().name().unwrap().get(0),
+                fb_data.subdirectories().unwrap().get(0).name().unwrap(),
                 "sub_directory"
             );
 
-            // Check that metadata arrays all have the same length
-            assert_eq!(fb_data.directories().unwrap().name().unwrap().len(), 1);
-            assert_eq!(fb_data.directories().unwrap().size().unwrap().len(), 1);
-            assert_eq!(fb_data.directories().unwrap().created().unwrap().len(), 1);
-            assert_eq!(fb_data.directories().unwrap().modified().unwrap().len(), 1);
-            assert_eq!(fb_data.directories().unwrap().accessed().unwrap().len(), 1);
-
             // Check that times are in the expected range (non-zero and recent)
-            let created = fb_data.directories().unwrap().created().unwrap().get(0);
-            let modified = fb_data.directories().unwrap().modified().unwrap().get(0);
-            let accessed = fb_data.directories().unwrap().accessed().unwrap().get(0);
+            let created = fb_data
+                .subdirectories()
+                .unwrap()
+                .get(0)
+                .times()
+                .unwrap()
+                .created();
+            let modified = fb_data
+                .subdirectories()
+                .unwrap()
+                .get(0)
+                .times()
+                .unwrap()
+                .modified();
+            let accessed = fb_data
+                .subdirectories()
+                .unwrap()
+                .get(0)
+                .times()
+                .unwrap()
+                .accessed();
 
             assert!(created > 0);
             assert!(modified > 0);
@@ -1185,7 +1245,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_find_path_existing() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/find_path", axum::routing::get(find_path_handler))
@@ -1204,7 +1268,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_find_path_filetype_validation() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/find_path", axum::routing::get(find_path_handler))
@@ -1234,7 +1302,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_find_path_nonexistent() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/find_path", axum::routing::get(find_path_handler))
@@ -1252,7 +1324,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_find_path_path_traversal() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/find_path", axum::routing::get(find_path_handler))
@@ -1274,7 +1350,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_file_download() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/get_file", axum::routing::get(file_download_handler))
@@ -1295,7 +1375,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_file_download_range() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/get_file", axum::routing::get(file_download_handler))
@@ -1386,7 +1470,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_file_download_head() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let app = Router::new()
                 .route("/get_file", axum::routing::head(file_download_handler))
@@ -1420,7 +1508,11 @@ mod tests {
         #[cfg(feature = "stats")]
         #[tokio::test]
         async fn test_cache_behavior() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -1452,7 +1544,11 @@ mod tests {
         #[cfg(feature = "stats")]
         #[tokio::test]
         async fn test_cache_expiration() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             // Manually insert an expired cache entry
             let path = state.base_path.join("test_dir");
@@ -1489,7 +1585,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_cache_invalidation_after_modification() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
             let file_path = temp_dir.join("modifiable.txt");
             File::create(&file_path).unwrap().write_all(b"v1").unwrap();
 
@@ -1517,7 +1617,7 @@ mod tests {
             assert_eq!(fb_data.size(), 2);
 
             // Fast-forward time beyond TTL
-            if let Some(mut foo) = state.meta_cache.get_async(&temp_dir).await {
+            if let Some(mut foo) = state.meta_cache.get_async(temp_dir).await {
                 let bar = foo.get_mut();
                 bar.1 -= tokio::time::Duration::from_secs(CACHE_TTL_SECONDS); // Set timestamp to simulate expiration
             }
@@ -1550,7 +1650,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_path_traversal_protection_posix() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route(
@@ -1671,7 +1775,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_path_traversal_protection_windows() {
-            let (_temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route(
@@ -1793,7 +1901,11 @@ mod tests {
         #[tokio::test]
         #[cfg(unix)]
         async fn test_permission_denied() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
             let restricted_dir = temp_dir.join("restricted");
             fs::create_dir(&restricted_dir).unwrap();
             let restricted_file = restricted_dir.join("no_access.txt");
@@ -1826,7 +1938,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_symlink_handling() {
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             // Create test file and valid symlink within base directory
             let target_path = temp_dir.join("target_file.txt");
@@ -1909,7 +2025,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_create_file() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -1967,7 +2087,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_rename_directory() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -2011,7 +2135,7 @@ mod tests {
                 "path should be removed from cache"
             );
             assert!(
-                !state.meta_cache.contains_async(&temp_dir).await,
+                !state.meta_cache.contains_async(temp_dir).await,
                 "parent path should be removed from cache"
             );
             assert!(
@@ -2026,7 +2150,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_rename_file() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -2075,7 +2203,7 @@ mod tests {
             );
 
             assert!(
-                state.meta_cache.contains_async(&temp_dir).await,
+                state.meta_cache.contains_async(temp_dir).await,
                 "grandparent path should remain in cache"
             );
         }
@@ -2083,7 +2211,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_remove_file() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -2135,7 +2267,7 @@ mod tests {
                 "parent path should be removed from cache"
             );
             assert!(
-                state.meta_cache.contains_async(&temp_dir).await,
+                state.meta_cache.contains_async(temp_dir).await,
                 "grandparent should remain in cache"
             );
             assert!(
@@ -2150,7 +2282,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_remove_directory() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -2196,7 +2332,11 @@ mod tests {
         #[tokio::test]
         async fn test_handle_fs_events_remove_directory_after_fresh_entry_insertion() {
             // Setup test cache
-            let (temp_dir, state) = setup_test_env().await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let temp_dir = temp.path();
+
+            let state = setup_test_env(temp_dir).await;
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -2227,7 +2367,7 @@ mod tests {
             _ = app.call(req).await.unwrap();
 
             {
-                let mut base_entry = state.meta_cache.get(&temp_dir).unwrap();
+                let mut base_entry = state.meta_cache.get(temp_dir).unwrap();
                 let (_, timestamp) = base_entry.get_mut();
                 *timestamp += std::time::Duration::from_secs(CACHE_TTL_SECONDS);
             }
