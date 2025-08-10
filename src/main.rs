@@ -711,23 +711,11 @@ mod tests {
 
             // Verify file timestamps from directory listing
             assert_eq!(
-                fb_dir
-                    .files()
-                    .unwrap()
-                    .get(file_index)
-                    .times()
-                    .unwrap()
-                    .created(),
+                fb_dir.files().unwrap().get(file_index).created(),
                 file_created_expected
             );
             assert_eq!(
-                fb_dir
-                    .files()
-                    .unwrap()
-                    .get(file_index)
-                    .times()
-                    .unwrap()
-                    .modified(),
+                fb_dir.files().unwrap().get(file_index).modified(),
                 file_modified_expected
             );
 
@@ -748,23 +736,11 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                fb_dir
-                    .subdirectories()
-                    .unwrap()
-                    .get(dir_index)
-                    .times()
-                    .unwrap()
-                    .created(),
+                fb_dir.subdirectories().unwrap().get(dir_index).created(),
                 subdir_created_expected
             );
             assert_eq!(
-                fb_dir
-                    .subdirectories()
-                    .unwrap()
-                    .get(dir_index)
-                    .times()
-                    .unwrap()
-                    .modified(),
+                fb_dir.subdirectories().unwrap().get(dir_index).modified(),
                 subdir_modified_expected
             );
         }
@@ -1212,27 +1188,9 @@ mod tests {
             );
 
             // Check that times are in the expected range (non-zero and recent)
-            let created = fb_data
-                .subdirectories()
-                .unwrap()
-                .get(0)
-                .times()
-                .unwrap()
-                .created();
-            let modified = fb_data
-                .subdirectories()
-                .unwrap()
-                .get(0)
-                .times()
-                .unwrap()
-                .modified();
-            let accessed = fb_data
-                .subdirectories()
-                .unwrap()
-                .get(0)
-                .times()
-                .unwrap()
-                .accessed();
+            let created = fb_data.subdirectories().unwrap().get(0).created();
+            let modified = fb_data.subdirectories().unwrap().get(0).modified();
+            let accessed = fb_data.subdirectories().unwrap().get(0).accessed();
 
             assert!(created > 0);
             assert!(modified > 0);

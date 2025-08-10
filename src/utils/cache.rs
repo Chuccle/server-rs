@@ -30,15 +30,6 @@ pub mod metadata {
                 ),
             }
         }
-
-        #[inline]
-        fn to_meta_times(self) -> crate::generated::blorg_meta_flat::MetaTimes {
-            crate::generated::blorg_meta_flat::MetaTimes::new(
-                self.created,
-                self.modified,
-                self.accessed,
-            )
-        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -68,15 +59,6 @@ pub mod metadata {
                         .unwrap_or_else(|_| std::time::SystemTime::now()),
                 ),
             }
-        }
-
-        #[inline]
-        fn to_meta_times(self) -> crate::generated::blorg_meta_flat::MetaTimes {
-            crate::generated::blorg_meta_flat::MetaTimes::new(
-                self.created,
-                self.modified,
-                self.accessed,
-            )
         }
     }
 
@@ -180,13 +162,14 @@ pub mod metadata {
                 .iter()
                 .zip(self.sub_dir_names.iter())
                 .map(|(entry, name)| {
-                    let times = entry.to_meta_times();
                     let name_fb = builder.create_string(name);
                     crate::generated::blorg_meta_flat::SubdirectoryMetadata::create(
                         &mut builder,
                         &crate::generated::blorg_meta_flat::SubdirectoryMetadataArgs {
                             name: Some(name_fb),
-                            times: Some(&times),
+                            accessed: entry.accessed,
+                            modified: entry.modified,
+                            created: entry.created,
                         },
                     )
                 })
@@ -197,14 +180,15 @@ pub mod metadata {
                 .iter()
                 .zip(self.file_names.iter())
                 .map(|(entry, name)| {
-                    let times = entry.to_meta_times();
                     let name_fb = builder.create_string(name);
                     crate::generated::blorg_meta_flat::FileEntryMetadata::create(
                         &mut builder,
                         &crate::generated::blorg_meta_flat::FileEntryMetadataArgs {
                             name: Some(name_fb),
                             size: entry.size,
-                            times: Some(&times),
+                            accessed: entry.accessed,
+                            modified: entry.modified,
+                            created: entry.created,
                         },
                     )
                 })
