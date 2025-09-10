@@ -20,5 +20,5 @@ pub mod time {
 }
 
 pub mod file {
-    pub const WINDOWS_MAX_PATH: u64 = 260;
+    pub const WINDOWS_MAX_PATH: u16 = 260;
 }

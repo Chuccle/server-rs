@@ -11,15 +11,25 @@ impl Cache {
         Self::default()
     }
 
+    #[cfg(feature = "stats")]
     pub fn increment_hits(&self) {
-        #[cfg(feature = "stats")]
         self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(not(feature = "stats"))]
+    pub fn increment_hits(&self) {
+        let _ = self;
+    }
+
+    #[cfg(feature = "stats")]
     pub fn increment_misses(&self) {
-        #[cfg(feature = "stats")]
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "stats"))]
+    pub fn increment_misses(&self) {
+        let _ = self;
     }
 
     #[cfg(feature = "stats")]
