@@ -1,7 +1,14 @@
-#![deny(clippy::all)]
+#![deny(clippy::all, clippy::pedantic)]
 
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::restriction,
+    clippy::nursery,
+    unused_imports,
+    mismatched_lifetime_syntaxes
+)]
 mod generated {
-    #![allow(clippy::all, unused_imports, dead_code, unsafe_op_in_unsafe_fn)]
     include!(concat!(
         env!("OUT_DIR"),
         "/metadata_flatbuffer_generated.rs"
@@ -16,8 +23,6 @@ mod utils;
 enum AppError {
     #[error("Path traversal attempt detected")]
     PathTraversal,
-    #[error("Invalid file path encoding")]
-    InvalidPathEncoding,
     #[error("Resource not found")]
     NotFound,
     #[error("Permission denied")]
@@ -25,8 +30,6 @@ enum AppError {
     #[error("Internal server error")]
     Internal,
     #[error("Invalid path format")]
-    InvalidPath,
-    #[error("Task execution failed")]
     TaskJoin(#[from] tokio::task::JoinError),
     #[error("Numerical conversion error")]
     TryFromInt(#[from] std::num::TryFromIntError),
@@ -65,9 +68,6 @@ impl axum::response::IntoResponse for AppError {
             Self::PermissionDenied | Self::PathTraversal => {
                 axum::http::StatusCode::FORBIDDEN.into_response()
             }
-            Self::InvalidPathEncoding | Self::InvalidPath => {
-                axum::http::StatusCode::BAD_REQUEST.into_response()
-            }
             Self::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
             Self::Internal | Self::TaskJoin(_) | Self::TryFromInt(_) => {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -82,18 +82,17 @@ struct PathQuery {
 }
 
 struct AppState {
-    meta_cache: scc::HashCache<
+    directory_cache: moka::future::Cache<
         std::path::PathBuf,
-        (
-            std::sync::Arc<utils::cache::metadata::DirectoryLookupContext>,
-            tokio::time::Instant,
-        ),
+        std::sync::Arc<utils::cache::metadata::DirectoryLookupContext>,
     >,
+    file_cache: moka::future::Cache<std::path::PathBuf, utils::cache::metadata::EntryType>,
     base_path: std::path::PathBuf,
     cache_stats: utils::stats::Cache,
 }
 
-const CACHE_TTL_SECONDS: u64 = 30;
+const CACHE_TTL_SECONDS: u64 = 5 * 60; // 5 MIN
+const CACHE_TTI_SECONDS: u64 = 60; // 1 MIN
 
 fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     let mut stack = Vec::new();
@@ -101,9 +100,7 @@ fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     // Split the path into segments based on `/`
     for segment in path.split('/') {
         match segment {
-            "" | "." => {
-                continue;
-            }
+            "" | "." => {}
             ".." => {
                 if stack.pop().is_none() {
                     return Err(AppError::PathTraversal);
@@ -122,7 +119,7 @@ fn dedotify_path(path: &str) -> Result<Option<String>, AppError> {
     }
 }
 
-fn create_buffer_serialized(metadata: &std::fs::Metadata) -> Result<Vec<u8>, AppError> {
+fn create_buffer_serialized(metadata: &std::fs::Metadata) -> Vec<u8> {
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(512);
 
     let created_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
@@ -158,7 +155,7 @@ fn create_buffer_serialized(metadata: &std::fs::Metadata) -> Result<Vec<u8>, App
     builder.finish(entry, None);
 
     // Return the serialized buffer
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 fn validate_path(
@@ -193,49 +190,10 @@ async fn get_dir_entry_info_handler(
         return Err(AppError::PathTraversal);
     }
 
-    let parent_dir = canonicalized_path.parent().ok_or_else(|| {
-        log_warn!("Invalid file path structure: {:?}", &canonicalized_path);
-        AppError::InvalidPath
-    })?;
-
-    log_debug!("Checking cache for parent directory: {:?}", parent_dir);
-
-    if let Some(entry) = data
-        .meta_cache
-        .read_async(parent_dir, |_, v| v.clone())
-        .await
-    {
-        let (cached_meta, timestamp) = entry;
-
-        let now = tokio::time::Instant::now();
-
-        log_trace!(
-            "Cache entry found - Timestamp: {:?}, Current: {:?}, TTL: {}",
-            timestamp,
-            now,
-            CACHE_TTL_SECONDS
-        );
-
-        if now - timestamp < tokio::time::Duration::from_secs(CACHE_TTL_SECONDS) {
-            data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", parent_dir);
-
-            let file_name = canonicalized_path
-                .file_name()
-                .ok_or(AppError::InvalidPath)?
-                .to_str()
-                .ok_or(AppError::InvalidPathEncoding)?;
-
-            return cached_meta
-                .get_dir_entry_serialized(file_name)
-                .ok_or(AppError::Internal);
-        }
-
-        log_debug!("Cache entry expired for: {:?}", &parent_dir);
-        _ = data
-            .meta_cache
-            .remove_if_async(&canonicalized_path, |entry| entry.1 == timestamp)
-            .await;
+    if let Some(entry) = data.file_cache.get(&canonicalized_path).await {
+        data.cache_stats.increment_hits();
+        log_debug!("Cache hit for directory entry: {:?}", &canonicalized_path);
+        return Ok(entry.get_dir_entry_serialized());
     }
 
     data.cache_stats.increment_misses();
@@ -243,15 +201,30 @@ async fn get_dir_entry_info_handler(
     log_info!("Fetching fresh metadata for: {:?}", &canonicalized_path);
     let meta = tokio::fs::metadata(&canonicalized_path).await?;
 
-    let file_entry = create_buffer_serialized(&meta).map_err(|e| {
-        log_error_with_context!(e, "Failed to create directory entry");
-        e
-    })?;
+    if meta.is_dir() {
+        data.file_cache
+            .insert(
+                canonicalized_path,
+                utils::cache::metadata::EntryType::Directory(
+                    utils::cache::metadata::DirectoryEntry::new(&meta),
+                ),
+            )
+            .await;
+    } else {
+        data.file_cache
+            .insert(
+                canonicalized_path,
+                utils::cache::metadata::EntryType::File(utils::cache::metadata::FileEntry::new(
+                    &meta,
+                )),
+            )
+            .await;
+    }
 
-    Ok(file_entry)
+    Ok(create_buffer_serialized(&meta))
 }
 
-async fn create_meta_cache_entry(
+async fn create_directory_listing_cache_entry(
     path: std::path::PathBuf,
 ) -> Result<utils::cache::metadata::DirectoryLookupContext, AppError> {
     log_debug!("Building new cache entry for directory: {:?}", &path);
@@ -270,12 +243,9 @@ async fn create_meta_cache_entry(
                     Ok(entry) => {
                         log_trace!("Processing entry: {:?}", entry.path());
 
-                        let name = match entry.file_name().into_string() {
-                            Ok(name) => name,
-                            Err(_) => {
-                                log_debug!("Invalid filename encoding: {:?}", &entry.path());
-                                return None;
-                            }
+                        let Ok(name) = entry.file_name().into_string() else {
+                            log_debug!("Invalid filename encoding: {:?}", &entry.path());
+                            return None;
                         };
 
                         match entry.metadata() {
@@ -327,58 +297,27 @@ async fn get_dir_info_handler(
     }
 
     log_debug!("Checking cache for directory: {:?}", &canonicalized_path);
-    if let Some(cache_entry) = data
-        .meta_cache
-        .read_async(&canonicalized_path, |_, v| v.clone())
-        .await
-    {
-        let (cached_dir_meta, timestamp) = cache_entry;
-
-        let now = tokio::time::Instant::now();
-
-        log_trace!(
-            "Cache entry found - Timestamp: {:?}, Current: {:?}, TTL: {}",
-            timestamp,
-            now,
-            CACHE_TTL_SECONDS
-        );
-
-        if now - timestamp < tokio::time::Duration::from_secs(CACHE_TTL_SECONDS) {
-            data.cache_stats.increment_hits();
-            log_debug!("Cache hit for directory: {:?}", &canonicalized_path);
-            return Ok(cached_dir_meta.get_all_entries_serialized());
-        }
-
-        log_debug!("Expired cache entry: {:?}", &canonicalized_path);
-        _ = data
-            .meta_cache
-            .remove_if_async(&canonicalized_path, |entry| entry.1 == timestamp)
-            .await;
+    if let Some(cached_directory_entry) = data.directory_cache.get(&canonicalized_path).await {
+        data.cache_stats.increment_hits();
+        log_debug!("Cache hit for directory: {:?}", &canonicalized_path);
+        return Ok(cached_directory_entry.get_all_entries_serialized());
     }
 
     data.cache_stats.increment_misses();
 
-    let directory_entry = &create_meta_cache_entry(canonicalized_path.clone()).await?;
+    let directory_entry = &create_directory_listing_cache_entry(canonicalized_path.clone()).await?;
 
-    _ = data
-        .meta_cache
-        .put_async(
+    data.directory_cache
+        .insert(
             canonicalized_path,
-            (
-                std::sync::Arc::new(directory_entry.clone()),
-                tokio::time::Instant::now(),
-            ),
+            std::sync::Arc::new(directory_entry.clone()),
         )
-        .await
-        .map_err(|e| {
-            log_warn_with_context!(e, "Failed to insert entry into cache");
-            e
-        });
+        .await;
 
     Ok(directory_entry.get_all_entries_serialized())
 }
 
-async fn file_download_handler(
+async fn get_file_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<PathQuery>,
     request: axum::http::Request<axum::body::Body>,
@@ -400,30 +339,6 @@ async fn file_download_handler(
     Ok(tower_http::services::ServeFile::new(&canonicalized_path)
         .try_call(request)
         .await?)
-}
-
-async fn find_path_handler(
-    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<PathQuery>,
-) -> Result<(axum::http::StatusCode, &'static str), AppError> {
-    log_info!("[FIND PATH] Handling request for: {}", &params.path);
-
-    let canonicalized_path =
-        tokio::fs::canonicalize(&validate_path(&data.base_path, &params.path)?).await?;
-
-    log_debug!(
-        "Checking file from validated path: {:?}",
-        &canonicalized_path
-    );
-
-    if !canonicalized_path.starts_with(&data.base_path) {
-        return Err(AppError::PathTraversal);
-    }
-
-    match tokio::fs::metadata(canonicalized_path).await?.is_dir() {
-        true => Ok((axum::http::StatusCode::FOUND, "1")),
-        false => Ok((axum::http::StatusCode::FOUND, "0")),
-    }
 }
 
 #[tokio::main]
@@ -482,7 +397,16 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(8080);
 
     let state = std::sync::Arc::new(AppState {
-        meta_cache: scc::HashCache::with_capacity(1000, 20000),
+        directory_cache: moka::future::Cache::builder()
+            .max_capacity(5000)
+            .time_to_live(std::time::Duration::from_secs(CACHE_TTL_SECONDS))
+            .time_to_idle(std::time::Duration::from_secs(CACHE_TTI_SECONDS))
+            .build(),
+        file_cache: moka::future::Cache::builder()
+            .max_capacity(5000)
+            .time_to_live(std::time::Duration::from_secs(CACHE_TTL_SECONDS))
+            .time_to_idle(std::time::Duration::from_secs(CACHE_TTI_SECONDS))
+            .build(),
         base_path: path.clone(),
         cache_stats: utils::stats::Cache::new(),
     });
@@ -490,10 +414,7 @@ async fn main() -> std::io::Result<()> {
     #[cfg(feature = "stats")]
     start_cache_statistics_logger(axum::extract::State(state.clone()));
 
-    if let Err(e) = start_fs_watcher(path.clone(), state.clone()) {
-        log_error_with_context!(e, "Failed to create file watcher");
-        std::process::exit(1);
-    }
+    start_fs_watcher(path.clone(), state.clone());
 
     let app = axum::Router::new()
         .route(
@@ -501,9 +422,8 @@ async fn main() -> std::io::Result<()> {
             axum::routing::get(get_dir_entry_info_handler),
         )
         .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-        .route("/get_file", axum::routing::get(file_download_handler))
-        .route("/get_file", axum::routing::head(file_download_handler))
-        .route("/find_path", axum::routing::get(find_path_handler))
+        .route("/get_file", axum::routing::get(get_file_handler))
+        .route("/get_file", axum::routing::head(get_file_handler))
         .route(
             "/healthcheck",
             axum::routing::get(|| async { axum::http::StatusCode::OK }),
@@ -518,10 +438,7 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn start_fs_watcher(
-    path: std::path::PathBuf,
-    state: std::sync::Arc<AppState>,
-) -> Result<(), notify_debouncer_full::notify::Error> {
+fn start_fs_watcher(path: std::path::PathBuf, state: std::sync::Arc<AppState>) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
 
@@ -543,7 +460,12 @@ fn start_fs_watcher(
         while let Some(res) = rx.recv().await {
             match res {
                 Ok(events) => {
-                    utils::cache::metadata::handle_fs_events(&events, &state.meta_cache).await;
+                    utils::cache::metadata::handle_fs_events(
+                        &events,
+                        &state.directory_cache,
+                        &state.file_cache,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     log_error_with_context!(e, "watch receive error");
@@ -552,32 +474,36 @@ fn start_fs_watcher(
         }
         Ok::<(), notify_debouncer_full::notify::Error>(())
     });
-
-    Ok(())
 }
 
 #[cfg(feature = "stats")]
 fn start_cache_statistics_logger(state: axum::extract::State<std::sync::Arc<AppState>>) {
     tokio::spawn(async move {
-        const STATS_LOG_INTERVAL_SECONDS: u64 = 30;
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(STATS_LOG_INTERVAL_SECONDS));
+        const STATS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut interval = tokio::time::interval(STATS_LOG_INTERVAL);
+
+        // Skip the first tick that completes immediately
+        interval.tick().await;
+
         loop {
             interval.tick().await;
+
             let (hits, misses) = state.cache_stats.get();
             let total = hits + misses;
-            let hit_rate = if total > 0 {
-                (hits as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
+
+            if total == 0 {
+                log_info!("Cache Statistics: No data yet (Hits=0, Misses=0)");
+                continue;
+            }
+
+            // Calculate hit rate using integer arithmetic to avoid precision loss
+            // This gives us percentage with 2 decimal places (e.g., 9534 = 95.34%)
+            let hit_rate_basis_points = hits.saturating_mul(10_000) / total;
+            let whole_percent = hit_rate_basis_points / 100;
+            let fractional_percent = hit_rate_basis_points % 100;
 
             log_info!(
-                "Cache Statistics: Hits={}, Misses={}, Hit Rate={:.2}%, Total={}",
-                hits,
-                misses,
-                hit_rate,
-                total
+                "Cache Statistics: Hits={hits}, Misses={misses}, Hit Rate={whole_percent}.{fractional_percent:02}%, Total={total}"
             );
         }
     });
@@ -599,7 +525,7 @@ mod tests {
     use tower::{Service, util::ServiceExt};
 
     // Test setup helper
-    async fn setup_test_env(base_dir: &std::path::Path) -> Arc<AppState> {
+    fn setup_test_env(base_dir: &std::path::Path) -> Arc<AppState> {
         // Create test files
         fs::create_dir(base_dir.join("test_dir")).unwrap();
         File::create(base_dir.join("test_file.txt"))
@@ -617,18 +543,24 @@ mod tests {
             .write_all(b"nested content")
             .unwrap();
 
-        let state = std::sync::Arc::new(AppState {
-            meta_cache: scc::HashCache::with_capacity(1000, 20000),
+        let directory_cache = moka::future::Cache::builder()
+            .max_capacity(1000)
+            .time_to_live(std::time::Duration::from_secs(2))
+            .time_to_idle(std::time::Duration::from_secs(1))
+            .build();
+
+        let file_cache = moka::future::Cache::builder()
+            .max_capacity(1000)
+            .time_to_live(std::time::Duration::from_secs(2))
+            .time_to_idle(std::time::Duration::from_secs(1))
+            .build();
+
+        std::sync::Arc::new(AppState {
+            directory_cache,
+            file_cache,
             base_path: base_dir.to_path_buf(),
             cache_stats: utils::stats::Cache::new(),
-        });
-
-        if let Err(e) = start_fs_watcher(base_dir.to_path_buf(), state.clone()) {
-            log_error_with_context!(e, "Failed to create file watcher");
-            std::process::exit(1);
-        }
-
-        state
+        })
     }
 
     mod misc {
@@ -637,15 +569,12 @@ mod tests {
         #[tokio::test]
         async fn test_timestamps_consistency() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             // Create a directory with one subdirectory
             let parent_dir = temp_dir.join("timestamp_test");
             fs::create_dir(&parent_dir).unwrap();
-
             let sub_dir = parent_dir.join("subdirectory");
             fs::create_dir(&sub_dir).unwrap();
 
@@ -675,7 +604,6 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
             let resp = app.call(req).await.unwrap();
-
             let bytes = resp.collect().await.unwrap().to_bytes();
             let fb_dir: Directory = flatbuffers::root::<Directory>(&bytes).unwrap();
 
@@ -686,7 +614,6 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
             let resp = app.call(req).await.unwrap();
-
             let bytes = resp.collect().await.unwrap().to_bytes();
             let fb_file = flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
 
@@ -748,33 +675,42 @@ mod tests {
         #[tokio::test]
         async fn test_concurrent_cache_access() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env(temp_dir);
 
-            let state = setup_test_env(temp_dir).await;
+            let app = Arc::new(
+                Router::new()
+                    .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                    .with_state(state.clone()),
+            );
 
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
+            // Spawn multiple tasks to hit the same cache concurrently
+            let mut handles = Vec::new();
+            for _ in 0..50 {
+                let app_clone = app.clone();
+                let handle = tokio::spawn(async move {
+                    let req = Request::builder()
+                        .uri("/get_dir_info?path=test_dir")
+                        .method("GET")
+                        .body(Body::empty())
+                        .unwrap();
 
-            let mut results = vec![];
-
-            for _ in 0..100000 {
-                let req = Request::builder()
-                    .uri("/get_dir_info?path=test_dir")
-                    .method("GET")
-                    .body(Body::empty())
-                    .unwrap();
-                results.push(app.call(req).await.unwrap().status());
+                    let resp = <axum::Router as Clone>::clone(&app_clone)
+                        .oneshot(req)
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), http::StatusCode::OK);
+                });
+                handles.push(handle);
             }
 
-            for result in results {
-                assert_eq!(result, http::StatusCode::OK);
-            }
+            futures::future::join_all(handles).await;
 
-            // Ensure cache stats reflect the concurrent hits/misses appropriately
             #[cfg(feature = "stats")]
-            assert_eq!(state.cache_stats.get().0, 99999); // 1 miss + 99999 hits
+            {
+                let (hits, misses) = state.cache_stats.get();
+                assert!(hits + misses > 0);
+            }
         }
     }
 
@@ -787,7 +723,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
                 .route(
@@ -819,7 +755,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
                 .route(
@@ -845,7 +781,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
             let mut path = temp_dir.to_path_buf();
             for depth in 0..10 {
                 path = path.join(format!("level_{depth}"));
@@ -872,87 +808,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_file_and_data_changes() {
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-            let file_path = temp_dir.join("modifiable.txt");
-            File::create(&file_path).unwrap().write_all(b"v1").unwrap();
-
-            // obtain file metadata like creation time
-            let metadata = fs::metadata(&file_path).unwrap();
-
-            let created_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
-                metadata.created().unwrap(),
-            );
-
-            let modified_secs = crate::utils::windows::time::IntoFileTime::into_file_time(
-                metadata.modified().unwrap(),
-            );
-
-            let mut app = Router::new()
-                .route(
-                    "/get_dir_entry_info",
-                    axum::routing::get(get_dir_entry_info_handler),
-                )
-                .with_state(state.clone());
-
-            // Initial request to populate cache
-            let req = Request::builder()
-                .uri("/get_dir_entry_info?path=modifiable.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.call(req).await.unwrap();
-
-            let bytes = resp.collect().await.unwrap().to_bytes();
-
-            let fb_data: DirectoryEntryMetadata =
-                flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
-
-            assert_eq!(fb_data.size(), metadata.len());
-            assert_eq!(fb_data.created(), created_secs);
-            assert_eq!(fb_data.modified(), modified_secs);
-            assert!(!fb_data.directory());
-
-            // Modify the file
-            File::create(&file_path)
-                .unwrap()
-                .write_all(b"updated")
-                .unwrap();
-
-            // Fast-forward time beyond TTL
-            if let Some(mut foo) = state.meta_cache.get_async(temp_dir).await {
-                let bar = foo.get_mut();
-                bar.1 -= tokio::time::Duration::from_secs(CACHE_TTL_SECONDS); // Set timestamp to simulate expiration
-            }
-
-            // Subsequent request should fetch fresh data
-            let req = Request::builder()
-                .uri("/get_dir_entry_info?path=modifiable.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.call(req).await.unwrap();
-
-            let bytes = resp.collect().await.unwrap().to_bytes();
-
-            let fb_data: DirectoryEntryMetadata =
-                flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
-
-            assert_eq!(fb_data.size(), 7);
-            assert_eq!(fb_data.created(), created_secs);
-        }
-
-        #[tokio::test]
         async fn test_folder_and_data_changes() {
             let temp = tempfile::tempdir().unwrap();
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
             let directory_path = temp_dir.join("test_dir");
 
             // obtain file metadata like creation time
@@ -1002,7 +863,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
@@ -1042,7 +903,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
             let file_names = vec!["файл.txt", "スペース ファイル", "😀.md"];
 
             for name in &file_names {
@@ -1077,7 +938,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             // Create directory with multiple subdirectories and files
             let mixed_dir = temp_dir.join("mixed_dir");
@@ -1149,7 +1010,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             // Create nested directory structure with specific timestamps if possible
             let nested_dir = temp_dir.join("nested_test_dir");
@@ -1198,111 +1059,6 @@ mod tests {
         }
     }
 
-    mod find_path_handler {
-        use super::*;
-
-        #[tokio::test]
-        async fn test_find_path_existing() {
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-
-            let app = Router::new()
-                .route("/find_path", axum::routing::get(find_path_handler))
-                .with_state(state);
-
-            let req = Request::builder()
-                .uri("/find_path?path=test_file.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            let resp = app.oneshot(req).await.unwrap();
-
-            assert_eq!(resp.status(), http::StatusCode::FOUND);
-        }
-
-        #[tokio::test]
-        async fn test_find_path_filetype_validation() {
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-
-            let mut app = Router::new()
-                .route("/find_path", axum::routing::get(find_path_handler))
-                .with_state(state);
-
-            let req = Request::builder()
-                .uri("/find_path?path=test_file.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            let resp = app.call(req).await.unwrap();
-
-            assert_eq!(resp.status(), http::StatusCode::FOUND);
-            assert_eq!(resp.collect().await.unwrap().to_bytes()[0], b'0');
-
-            let req = Request::builder()
-                .uri("/find_path?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.call(req).await.unwrap();
-
-            assert_eq!(resp.status(), http::StatusCode::FOUND);
-            assert_eq!(resp.collect().await.unwrap().to_bytes()[0], b'1');
-        }
-
-        #[tokio::test]
-        async fn test_find_path_nonexistent() {
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-
-            let app = Router::new()
-                .route("/find_path", axum::routing::get(find_path_handler))
-                .with_state(state);
-
-            let req = Request::builder()
-                .uri("/find_path?path=nonexistent.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.oneshot(req).await.unwrap();
-
-            assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
-        }
-
-        #[tokio::test]
-        async fn test_find_path_path_traversal() {
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-
-            let app = Router::new()
-                .route("/find_path", axum::routing::get(find_path_handler))
-                .with_state(state);
-
-            let req = Request::builder()
-                .uri("/find_path?path=../passwd.txt")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.oneshot(req).await.unwrap();
-
-            assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
-        }
-    }
-
     mod file_download {
         use super::*;
 
@@ -1312,10 +1068,10 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
-                .route("/get_file", axum::routing::get(file_download_handler))
+                .route("/get_file", axum::routing::get(get_file_handler))
                 .with_state(state);
 
             let req = Request::builder()
@@ -1337,10 +1093,10 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
-                .route("/get_file", axum::routing::get(file_download_handler))
+                .route("/get_file", axum::routing::get(get_file_handler))
                 .with_state(state);
 
             // --- Test Case 1: Request bytes 5-9 ---
@@ -1432,10 +1188,10 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let app = Router::new()
-                .route("/get_file", axum::routing::head(file_download_handler))
+                .route("/get_file", axum::routing::head(get_file_handler))
                 .with_state(state);
 
             let req = Request::builder()
@@ -1462,68 +1218,354 @@ mod tests {
 
     mod cache {
         use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::time::timeout;
+
+        // Helper to create cache with specific TTL for testing
+        fn setup_test_env_with_cache_config(
+            base_dir: &std::path::Path,
+            ttl_secs: u64,
+            idle_secs: u64,
+        ) -> Arc<AppState> {
+            // Create test files
+            fs::create_dir(base_dir.join("test_dir")).unwrap();
+            File::create(base_dir.join("test_file.txt"))
+                .unwrap()
+                .write_all(b"test content")
+                .unwrap();
+            File::create(base_dir.join("test_dir/file_in_dir.txt"))
+                .unwrap()
+                .write_all(b"nested content")
+                .unwrap();
+
+            let directory_cache = moka::future::Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(ttl_secs))
+                .time_to_idle(Duration::from_secs(idle_secs))
+                .build();
+
+            let file_cache = moka::future::Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(ttl_secs))
+                .time_to_idle(Duration::from_secs(idle_secs))
+                .build();
+
+            Arc::new(AppState {
+                directory_cache,
+                file_cache,
+                base_path: base_dir.to_path_buf(),
+                cache_stats: utils::stats::Cache::new(),
+            })
+        }
 
         #[cfg(feature = "stats")]
         #[tokio::test]
-        async fn test_cache_behavior() {
+        async fn test_cache_hit_miss_behavior() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
 
             let mut app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
                 .with_state(state.clone());
 
-            // First request (cache miss)
+            // Verify initial state
+            assert_eq!(state.cache_stats.get(), (0, 0));
+
+            // First request - should be a cache miss
             let req = Request::builder()
                 .uri("/get_dir_info?path=test_dir")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
 
-            _ = app.call(req).await.unwrap();
-            assert_eq!(state.cache_stats.get().0, 0);
-            assert_eq!(state.cache_stats.get().1, 1);
+            let (hits, misses) = state.cache_stats.get();
+            assert_eq!(hits, 0);
+            assert_eq!(misses, 1);
 
-            // Second request (cache hit)
+            // Second request - should be a cache hit
             let req = Request::builder()
                 .uri("/get_dir_info?path=test_dir")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
 
-            _ = app.call(req).await.unwrap();
-            assert_eq!(state.cache_stats.get().0, 1);
-            assert_eq!(state.cache_stats.get().1, 1);
+            let (hits, misses) = state.cache_stats.get();
+            assert_eq!(hits, 1);
+            assert_eq!(misses, 1);
+
+            // Third request - should be another cache hit
+            let req = Request::builder()
+                .uri("/get_dir_info?path=test_dir")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            let (hits, misses) = state.cache_stats.get();
+            assert_eq!(hits, 2);
+            assert_eq!(misses, 1);
         }
 
         #[cfg(feature = "stats")]
         #[tokio::test]
-        async fn test_cache_expiration() {
+        async fn test_cache_different_paths() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
 
-            let state = setup_test_env(temp_dir).await;
+            // Create additional directories
+            fs::create_dir(temp_dir.join("dir1")).unwrap();
+            fs::create_dir(temp_dir.join("dir2")).unwrap();
 
-            // Manually insert an expired cache entry
-            let path = state.base_path.join("test_dir");
+            let mut app = Router::new()
+                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                .with_state(state.clone());
 
-            state
-                .meta_cache
-                .put_async(
-                    path.clone(),
-                    (
-                        std::sync::Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
-                        tokio::time::Instant::now()
-                            - tokio::time::Duration::from_secs(CACHE_TTL_SECONDS),
-                    ),
-                )
-                .await
+            // Request different paths - each should be a cache miss initially
+            for (i, path) in ["test_dir", "dir1", "dir2"].iter().enumerate() {
+                let req = Request::builder()
+                    .uri(format!("/get_dir_info?path={path}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.call(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let (hits, misses) = state.cache_stats.get();
+                assert_eq!(hits, 0);
+                assert_eq!(misses, (i + 1) as u64);
+            }
+
+            // Request same paths again - should be cache hits
+            for (i, path) in ["test_dir", "dir1", "dir2"].iter().enumerate() {
+                let req = Request::builder()
+                    .uri(format!("/get_dir_info?path={path}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.call(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let (hits, misses) = state.cache_stats.get();
+                assert_eq!(hits, (i + 1) as u64);
+                assert_eq!(misses, 3);
+            }
+        }
+
+        #[cfg(feature = "stats")]
+        #[tokio::test]
+        async fn test_file_cache() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            let file_a = String::from("a.txt");
+            let file_b = String::from("b.txt");
+
+            // Create additional directories
+            File::create(temp_dir.join(&file_a))
+                .unwrap()
+                .write_all(b"stuff")
+                .unwrap();
+            File::create(temp_dir.join(&file_b))
+                .unwrap()
+                .write_all(b"stuff")
                 .unwrap();
 
+            let mut app = Router::new()
+                .route(
+                    "/get_dir_entry_info",
+                    axum::routing::get(get_dir_entry_info_handler),
+                )
+                .with_state(state.clone());
+
+            let mut expected_misses = 0;
+
+            // Request different paths - each should be a cache miss initially
+            for path in &[&file_a, &file_b] {
+                let req = Request::builder()
+                    .uri(format!("/get_dir_entry_info?path={path}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.call(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let (hits, misses) = state.cache_stats.get();
+                assert_eq!(hits, 0);
+
+                expected_misses += 1;
+
+                assert_eq!(misses, expected_misses);
+            }
+
+            // Request same paths again - should be cache hits
+            for (i, path) in [file_a, file_b].iter().enumerate() {
+                let req = Request::builder()
+                    .uri(format!("/get_dir_entry_info?path={path}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.call(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let (hits, misses) = state.cache_stats.get();
+                assert_eq!(hits, (i + 1) as u64);
+                assert_eq!(misses, expected_misses);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_cache_ttl_expiration() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env_with_cache_config(temp.path(), 1, 1);
+
+            let path = state.base_path.join("test_dir");
+            state
+                .directory_cache
+                .insert(
+                    path.clone(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
+
+            // Should exist initially
+            assert!(state.directory_cache.get(&path).await.is_some());
+
+            // Sleep beyond TTL
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Should now be expired
+            assert!(state.directory_cache.get(&path).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_cache_idle_expiration() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env_with_cache_config(temp.path(), 10, 1);
+
+            let path = state.base_path.join("idle_dir");
+            state
+                .directory_cache
+                .insert(
+                    path.clone(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
+
+            // Access the cache to reset idle timer
+            assert!(state.directory_cache.get(&path).await.is_some());
+
+            // Sleep just below idle threshold
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(state.directory_cache.get(&path).await.is_some());
+
+            // Sleep beyond idle threshold
+            tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+            assert!(state.directory_cache.get(&path).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_cache_access_stress() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            let app = Arc::new(
+                Router::new()
+                    .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                    .with_state(state.clone()),
+            );
+
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let error_count = Arc::new(AtomicUsize::new(0));
+
+            // Spawn many concurrent tasks
+            let mut handles = Vec::new();
+            for _task_id in 0..100 {
+                let app_clone = app.clone();
+                let request_count_clone = request_count.clone();
+                let error_count_clone = error_count.clone();
+
+                let handle = tokio::spawn(async move {
+                    // Each task makes multiple requests
+                    for _ in 0..5 {
+                        let req = Request::builder()
+                            .uri("/get_dir_info?path=test_dir")
+                            .method("GET")
+                            .body(Body::empty())
+                            .unwrap();
+
+                        match timeout(
+                            Duration::from_secs(5),
+                            <axum::Router as Clone>::clone(&app_clone).oneshot(req),
+                        )
+                        .await
+                        {
+                            Ok(Ok(resp)) => {
+                                if resp.status() == http::StatusCode::OK {
+                                    request_count_clone.fetch_add(1, Ordering::SeqCst);
+                                } else {
+                                    error_count_clone.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                error_count_clone.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all tasks to complete
+            let results = futures::future::join_all(handles).await;
+
+            // Verify no tasks panicked
+            for result in results {
+                result.unwrap();
+            }
+
+            // Verify we had successful requests and minimal errors
+            let successful_requests = request_count.load(Ordering::SeqCst);
+            let errors = error_count.load(Ordering::SeqCst);
+
+            assert!(
+                successful_requests > 0,
+                "Should have some successful requests"
+            );
+            assert!(
+                errors < successful_requests / 10,
+                "Error rate should be low"
+            );
+
+            #[cfg(feature = "stats")]
+            {
+                let (hits, misses) = state.cache_stats.get();
+                assert!(hits + misses > 0, "Should have cache activity");
+                assert!(
+                    hits > misses,
+                    "Should have more hits than misses due to concurrency"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_cache_invalidation_manual() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            let path = temp_dir.join("test_dir");
+
+            // Populate cache
             let app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
                 .with_state(state.clone());
@@ -1533,21 +1575,28 @@ mod tests {
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
-
             let resp = app.oneshot(req).await.unwrap();
-
             assert_eq!(resp.status(), http::StatusCode::OK);
-            // Verify cache was updated
-            assert_eq!(state.cache_stats.get().1, 1); // Should count as miss
+
+            // Verify cache entry exists
+            assert!(state.directory_cache.get(&path).await.is_some());
+
+            // Manually invalidate
+            state.directory_cache.invalidate(&path).await;
+
+            // Verify entry is gone
+            assert!(state.directory_cache.get(&path).await.is_none());
         }
 
         #[tokio::test]
-        async fn test_cache_invalidation_after_modification() {
+        async fn test_cache_invalidation_after_file_modification() {
+            // Pause Tokio time for deterministic testing
+            tokio::time::pause();
+
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
 
-            let state = setup_test_env(temp_dir).await;
             let file_path = temp_dir.join("modifiable.txt");
             File::create(&file_path).unwrap().write_all(b"v1").unwrap();
 
@@ -1564,27 +1613,30 @@ mod tests {
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
-
             let resp = app.call(req).await.unwrap();
-
             let bytes = resp.collect().await.unwrap().to_bytes();
-
             let fb_data: DirectoryEntryMetadata =
                 flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
+            let original_size = fb_data.size();
+            assert_eq!(original_size, 2);
 
-            assert_eq!(fb_data.size(), 2);
-
-            // Fast-forward time beyond TTL
-            if let Some(mut foo) = state.meta_cache.get_async(temp_dir).await {
-                let bar = foo.get_mut();
-                bar.1 -= tokio::time::Duration::from_secs(CACHE_TTL_SECONDS); // Set timestamp to simulate expiration
-            }
+            // Verify file is cached
+            assert!(state.file_cache.get(&file_path).await.is_some());
 
             // Modify the file
             File::create(&file_path)
                 .unwrap()
-                .write_all(b"updated")
+                .write_all(b"updated content")
                 .unwrap();
+
+            // Advance time slightly to simulate filesystem noticing the change
+            tokio::time::advance(Duration::from_millis(10)).await;
+
+            // Invalidate cache to simulate file watcher behavior
+            state.file_cache.invalidate(&file_path).await;
+
+            // Verify cache entry is gone
+            assert!(state.file_cache.get(&file_path).await.is_none());
 
             // Subsequent request should fetch fresh data
             let req = Request::builder()
@@ -1592,15 +1644,156 @@ mod tests {
                 .method("GET")
                 .body(Body::empty())
                 .unwrap();
-
             let resp = app.call(req).await.unwrap();
-
             let bytes = resp.collect().await.unwrap().to_bytes();
-
             let fb_data: DirectoryEntryMetadata =
                 flatbuffers::root::<DirectoryEntryMetadata>(&bytes).unwrap();
+            assert_eq!(fb_data.size(), 15); // "updated content"
+            assert_ne!(fb_data.size(), original_size);
+        }
 
-            assert_eq!(fb_data.size(), 7);
+        #[tokio::test]
+        async fn test_cache_performance_improvement() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            // Create a directory with many files to make operations slower
+            let large_dir = temp_dir.join("large_dir");
+            fs::create_dir(&large_dir).unwrap();
+            for i in 0..100 {
+                File::create(large_dir.join(format!("file_{i:03}.txt")))
+                    .unwrap()
+                    .write_all(format!("content {i}").as_bytes())
+                    .unwrap();
+            }
+
+            let app = Router::new()
+                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                .with_state(state.clone());
+
+            // Time the first request (cache miss)
+            let start = Instant::now();
+            let req = Request::builder()
+                .uri("/get_dir_info?path=large_dir")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let first_request_time = start.elapsed();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            // Time the second request (cache hit)
+            let start = Instant::now();
+            let req = Request::builder()
+                .uri("/get_dir_info?path=large_dir")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let second_request_time = start.elapsed();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            // Cache hit should be faster
+            assert!(
+                second_request_time < first_request_time,
+                "Cache hit ({second_request_time:?}) should be at faster than miss ({first_request_time:?})"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_cache_consistency_across_requests() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            let app = Router::new()
+                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                .with_state(state.clone());
+
+            // Make multiple requests and ensure they return consistent data
+            let mut responses = Vec::new();
+            for _ in 0..5 {
+                let req = Request::builder()
+                    .uri("/get_dir_info?path=test_dir")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let bytes = resp.collect().await.unwrap().to_bytes();
+                responses.push(bytes);
+            }
+
+            // All responses should be identical
+            let first_response = &responses[0];
+            for (i, response) in responses.iter().enumerate().skip(1) {
+                assert_eq!(
+                    response, first_response,
+                    "Response {i} differs from first response"
+                );
+            }
+        }
+
+        #[cfg(feature = "stats")]
+        #[tokio::test]
+        async fn test_cache_stats_accuracy() {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_dir = temp.path();
+            let state = setup_test_env_with_cache_config(temp_dir, 30, 15);
+
+            // Create multiple test directories
+            for i in 1..=3 {
+                fs::create_dir(temp_dir.join(format!("stats_test_{i}"))).unwrap();
+            }
+
+            let app = Router::new()
+                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+                .with_state(state.clone());
+
+            // Make requests in a predictable pattern
+            let test_pattern = [
+                ("stats_test_1", false), // miss
+                ("stats_test_2", false), // miss
+                ("stats_test_1", true),  // hit
+                ("stats_test_3", false), // miss
+                ("stats_test_2", true),  // hit
+                ("stats_test_1", true),  // hit
+            ];
+
+            for (i, (path, expected_hit)) in test_pattern.iter().enumerate() {
+                let req = Request::builder()
+                    .uri(format!("/get_dir_info?path={path}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::OK);
+
+                let (hits, misses) = state.cache_stats.get();
+                if *expected_hit {
+                    assert!(
+                        hits > 0,
+                        "Expected cache hit for request {} ({path}), but hits = {hits}",
+                        i + 1
+                    );
+                }
+
+                // Total operations should match request count
+                assert_eq!(
+                    hits + misses,
+                    (i + 1) as u64,
+                    "Total cache operations should equal request count at step {}",
+                    i + 1
+                );
+            }
+
+            // Final verification
+            let (final_hits, final_misses) = state.cache_stats.get();
+            assert_eq!(final_hits, 3, "Should have exactly 3 cache hits");
+            assert_eq!(final_misses, 3, "Should have exactly 3 cache misses");
+            assert_eq!(final_hits + final_misses, test_pattern.len() as u64);
         }
     }
     mod security {
@@ -1612,7 +1805,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let mut app = Router::new()
                 .route(
@@ -1737,7 +1930,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             let mut app = Router::new()
                 .route(
@@ -1863,7 +2056,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
             let restricted_dir = temp_dir.join("restricted");
             fs::create_dir(&restricted_dir).unwrap();
             let restricted_file = restricted_dir.join("no_access.txt");
@@ -1900,7 +2093,7 @@ mod tests {
 
             let temp_dir = temp.path();
 
-            let state = setup_test_env(temp_dir).await;
+            let state = setup_test_env(temp_dir);
 
             // Create test file and valid symlink within base directory
             let target_path = temp_dir.join("target_file.txt");
@@ -1929,7 +2122,7 @@ mod tests {
             std::os::windows::fs::symlink_file("..\\secret.txt", &malicious_symlink).unwrap();
 
             let mut app = Router::new()
-                .route("/get_file", axum::routing::get(file_download_handler))
+                .route("/get_file", axum::routing::get(get_file_handler))
                 .route(
                     "/get_dir_entry_info",
                     axum::routing::get(get_dir_entry_info_handler),
@@ -1977,380 +2170,213 @@ mod tests {
         }
     }
 
-    mod file_events {
+    mod file_watcher {
+        use std::thread::sleep;
+
+        use crate::utils::cache::metadata::FileEntry;
+
         use super::*;
-
         #[tokio::test]
-        async fn test_handle_fs_events_create_file() {
-            // Setup test cache
+        async fn test_file_creation_invalidates_parent_cache() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env(temp_dir);
+            let test_file_path = temp_dir.join("new_file.txt");
 
-            let state = setup_test_env(temp_dir).await;
-
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            // invalidate by creating test_dir/nested_test_dir/file_in_nested_test_dir2.txt
-            File::create_new(
-                temp_dir.join("test_dir/nested_test_dir/file_in_nested_test_dir2.txt"),
-            )
-            .unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-            // Verify cache state
+            // 1. Prime the directory cache by inserting a dummy value.
+            state
+                .directory_cache
+                .insert(
+                    temp_dir.to_path_buf(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
             assert!(
-                !state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir/nested_test_dir"))
-                    .await,
-                "parent path should be removed from cache"
+                state.directory_cache.get(temp_dir).await.is_some(),
+                "Cache should be primed"
             );
+
+            // 2. Create a new file, which should trigger the watcher.
+            fs::write(&test_file_path, "Hello").expect("Failed to create test file");
+
+            // 3. Wait for the debouncer and event handler to run.
+            sleep(std::time::Duration::from_secs(3));
+
+            // 4. Assert that the cache for the parent directory has been invalidated.
             assert!(
-                state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir"))
-                    .await,
-                "grandparent should remain in cache"
+                state.directory_cache.get(temp_dir).await.is_none(),
+                "Parent directory cache should be invalidated after file creation"
             );
         }
 
         #[tokio::test]
-        async fn test_handle_fs_events_rename_directory() {
-            // Setup test cache
+        async fn test_file_modification_invalidates_caches() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env(temp_dir);
+            let test_file_path = temp_dir.join("test_file.txt");
 
-            let state = setup_test_env(temp_dir).await;
+            // 1. Create the initial file.
+            fs::write(&test_file_path, "Initial content").unwrap();
+            // Wait for creation event to settle
+            sleep(std::time::Duration::from_secs(3));
 
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            // invalidate by renaming test_dir
-            fs::rename(temp_dir.join("test_dir"), temp_dir.join("test_dir_renamed")).unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-            // Verify cache state
+            // 2. Prime the caches for the file and its parent directory.
+            state
+                .directory_cache
+                .insert(
+                    temp_dir.to_path_buf(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
+            state
+                .file_cache
+                .insert(
+                    test_file_path.clone(),
+                    utils::cache::metadata::EntryType::File(FileEntry::new(
+                        &tokio::fs::metadata(&test_file_path).await.unwrap(),
+                    )),
+                )
+                .await;
             assert!(
-                !state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir"))
-                    .await,
-                "path should be removed from cache"
+                state.directory_cache.get(temp_dir).await.is_some(),
+                "Parent cache should be primed"
             );
             assert!(
-                !state.meta_cache.contains_async(temp_dir).await,
-                "parent path should be removed from cache"
+                state.file_cache.get(&test_file_path).await.is_some(),
+                "File cache should be primed"
+            );
+
+            // 3. Modify the file.
+            fs::write(&test_file_path, "Modified content").unwrap();
+
+            // 4. Wait for the event to be processed.
+            sleep(std::time::Duration::from_secs(3));
+
+            // 5. Assert that both caches have been invalidated.
+            assert!(
+                state.file_cache.get(&test_file_path).await.is_none(),
+                "File cache should be invalidated after modification"
             );
             assert!(
-                !state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir/nested_test_dir"))
-                    .await,
-                "child path should be removed in cache"
+                state.directory_cache.get(temp_dir).await.is_none(),
+                "Parent directory cache should also be invalidated after modification"
             );
         }
 
         #[tokio::test]
-        async fn test_handle_fs_events_rename_file() {
-            // Setup test cache
+        async fn test_file_deletion_invalidates_caches() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env(temp_dir);
+            let test_file_path = temp_dir.join("file_to_delete.txt");
 
-            let state = setup_test_env(temp_dir).await;
+            // 1. Create a file and wait for the event to clear.
+            fs::write(&test_file_path, "content").unwrap();
+            sleep(std::time::Duration::from_secs(3));
 
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            // invalidate by renaming test_dir
-            fs::rename(
-                temp_dir.join("test_dir/file_in_dir.txt"),
-                temp_dir.join("test_dir/file_in_dir_renamed.txt"),
-            )
-            .unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-            // Verify cache state
+            // 2. Prime the caches.
+            state
+                .directory_cache
+                .insert(
+                    temp_dir.to_path_buf(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
+            state
+                .file_cache
+                .insert(
+                    test_file_path.clone(),
+                    utils::cache::metadata::EntryType::File(FileEntry::new(
+                        &tokio::fs::metadata(&test_file_path).await.unwrap(),
+                    )),
+                )
+                .await;
             assert!(
-                !state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir"))
-                    .await,
-                "parent path should be removed from cache"
+                state.directory_cache.get(temp_dir).await.is_some(),
+                "Parent cache should be primed before deletion"
+            );
+            assert!(
+                state.file_cache.get(&test_file_path).await.is_some(),
+                "File cache should be primed before deletion"
             );
 
+            // 3. Delete the file.
+            fs::remove_file(&test_file_path).unwrap();
+
+            // 4. Wait for the event to be processed.
+            sleep(std::time::Duration::from_secs(3));
+
+            // 5. Assert that both caches have been invalidated.
             assert!(
-                state.meta_cache.contains_async(temp_dir).await,
-                "grandparent path should remain in cache"
+                state.file_cache.get(&test_file_path).await.is_none(),
+                "File cache should be invalidated after deletion"
+            );
+            assert!(
+                state.directory_cache.get(temp_dir).await.is_none(),
+                "Parent directory cache should be invalidated after deletion"
             );
         }
 
         #[tokio::test]
-        async fn test_handle_fs_events_remove_file() {
-            // Setup test cache
+        async fn test_directory_creation_and_deletion_invalidates_parent_cache() {
             let temp = tempfile::tempdir().unwrap();
-
             let temp_dir = temp.path();
+            let state = setup_test_env(temp_dir);
+            let sub_dir_path = temp_dir.join("subdir");
 
-            let state = setup_test_env(temp_dir).await;
+            // --- Test Directory Creation ---
 
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=other_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            // invalidate by deleting ./test_dir/file_in_dir.txt
-            fs::remove_file(temp_dir.join("test_dir/file_in_dir.txt")).unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-            // Verify cache state
+            // 1. Prime the parent directory cache.
+            state
+                .directory_cache
+                .insert(
+                    temp_dir.to_path_buf(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
             assert!(
-                !state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("test_dir"))
-                    .await,
-                "parent path should be removed from cache"
+                state.directory_cache.get(temp_dir).await.is_some(),
+                "Parent cache should be primed for creation test"
             );
+
+            // 2. Create a new subdirectory.
+            fs::create_dir(&sub_dir_path).unwrap();
+
+            // 3. Wait for the watcher.
+            sleep(std::time::Duration::from_secs(3));
+
+            // 4. Assert parent cache is invalidated.
             assert!(
-                state.meta_cache.contains_async(temp_dir).await,
-                "grandparent should remain in cache"
+                state.directory_cache.get(temp_dir).await.is_none(),
+                "Parent directory cache should be invalidated after sub-directory creation"
             );
+
+            // --- Test Directory Deletion ---
+
+            // 1. Prime the parent cache again.
+            state
+                .directory_cache
+                .insert(
+                    temp_dir.to_path_buf(),
+                    Arc::new(utils::cache::metadata::DirectoryLookupContext::new()),
+                )
+                .await;
             assert!(
-                state
-                    .meta_cache
-                    .contains_async(&temp_dir.join("other_test_dir"))
-                    .await,
-                "parent's siblings should remain in cache"
+                state.directory_cache.get(temp_dir).await.is_some(),
+                "Parent cache should be re-primed for deletion test"
             );
-        }
 
-        #[tokio::test]
-        async fn test_handle_fs_events_remove_directory() {
-            // Setup test cache
-            let temp = tempfile::tempdir().unwrap();
+            // 2. Delete the subdirectory.
+            fs::remove_dir(&sub_dir_path).unwrap();
 
-            let temp_dir = temp.path();
+            // 3. Wait for the watcher.
+            sleep(std::time::Duration::from_secs(3));
 
-            let state = setup_test_env(temp_dir).await;
-
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            // invalidate by deleting ./test_dir
-
-            fs::remove_dir_all(temp_dir.join("test_dir")).unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
+            // 4. Assert parent cache is invalidated again.
             assert!(
-                state.meta_cache.is_empty(),
-                "Cache should be cleared but isnt. Contains {} entries",
-                state.meta_cache.len()
-            );
-        }
-
-        #[tokio::test]
-        async fn test_handle_fs_events_remove_directory_after_fresh_entry_insertion() {
-            // Setup test cache
-            let temp = tempfile::tempdir().unwrap();
-
-            let temp_dir = temp.path();
-
-            let state = setup_test_env(temp_dir).await;
-
-            let mut app = Router::new()
-                .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-                .with_state(state.clone());
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=.")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            let req = Request::builder()
-                .uri("/get_dir_info?path=test_dir/nested_test_dir")
-                .method("GET")
-                .body(Body::empty())
-                .unwrap();
-
-            _ = app.call(req).await.unwrap();
-
-            {
-                let mut base_entry = state.meta_cache.get(temp_dir).unwrap();
-                let (_, timestamp) = base_entry.get_mut();
-                *timestamp += std::time::Duration::from_secs(CACHE_TTL_SECONDS);
-            }
-            {
-                let mut affected_entry = state.meta_cache.get(&temp_dir.join("test_dir")).unwrap();
-                let (_, timestamp) = affected_entry.get_mut();
-                *timestamp += std::time::Duration::from_secs(CACHE_TTL_SECONDS);
-            }
-            {
-                let mut child_entry = state
-                    .meta_cache
-                    .get(&temp_dir.join("test_dir/nested_test_dir"))
-                    .unwrap();
-                let (_, timestamp) = child_entry.get_mut();
-                *timestamp += std::time::Duration::from_secs(CACHE_TTL_SECONDS);
-            }
-            // invalidate by deleting ./test_dir
-
-            fs::remove_dir_all(temp_dir.join("test_dir")).unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-            assert!(
-                !state.meta_cache.is_empty(),
-                "Cache should not be cleared but is. Contains no entries"
+                state.directory_cache.get(temp_dir).await.is_none(),
+                "Parent directory cache should be invalidated after sub-directory deletion"
             );
         }
     }

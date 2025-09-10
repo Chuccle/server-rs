@@ -10,7 +10,7 @@ pub mod metadata {
 
     impl FileEntry {
         #[inline]
-        fn new(metadata: &std::fs::Metadata) -> Self {
+        pub fn new(metadata: &std::fs::Metadata) -> Self {
             Self {
                 size: metadata.len(),
                 created: crate::utils::windows::time::IntoFileTime::into_file_time(
@@ -33,15 +33,15 @@ pub mod metadata {
     }
 
     #[derive(Debug, Clone, Copy)]
-    pub struct SubdirectoryEntry {
+    pub struct DirectoryEntry {
         created: u64,
         modified: u64,
         accessed: u64,
     }
 
-    impl SubdirectoryEntry {
+    impl DirectoryEntry {
         #[inline]
-        fn new(metadata: &std::fs::Metadata) -> Self {
+        pub fn new(metadata: &std::fs::Metadata) -> Self {
             Self {
                 created: crate::utils::windows::time::IntoFileTime::into_file_time(
                     metadata
@@ -65,16 +65,42 @@ pub mod metadata {
     #[derive(Debug, Clone, Copy)]
     pub enum EntryType {
         File(FileEntry),
-        Directory(SubdirectoryEntry),
+        Directory(DirectoryEntry),
+    }
+
+    impl EntryType {
+        #[inline]
+        pub fn get_dir_entry_serialized(&self) -> Vec<u8> {
+            let capacity = 64;
+            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
+
+            let (size, created, modified, accessed, is_directory) = match self {
+                EntryType::File(f) => (f.size, f.created, f.modified, f.accessed, false),
+                EntryType::Directory(d) => (0, d.created, d.modified, d.accessed, true),
+            };
+
+            let dir_entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
+                &mut builder,
+                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
+                    size,
+                    created,
+                    modified,
+                    accessed,
+                    directory: is_directory,
+                },
+            );
+
+            builder.finish(dir_entry, None);
+            builder.finished_data().to_vec()
+        }
     }
 
     #[derive(Debug, Clone)]
     pub struct DirectoryLookupContext {
         files: Vec<FileEntry>,
         file_names: Vec<String>,
-        sub_dirs: Vec<SubdirectoryEntry>,
+        sub_dirs: Vec<DirectoryEntry>,
         sub_dir_names: Vec<String>,
-        name_to_entry: std::collections::HashMap<String, (bool, usize)>,
     }
 
     impl DirectoryLookupContext {
@@ -84,28 +110,23 @@ pub mod metadata {
                 file_names: Vec::new(),
                 sub_dirs: Vec::new(),
                 sub_dir_names: Vec::new(),
-                name_to_entry: std::collections::HashMap::new(),
             }
         }
 
         #[inline]
         pub fn add_file(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let idx = self.files.len();
             let entry = FileEntry::new(metadata);
 
             self.files.push(entry);
             self.file_names.push(name.to_owned());
-            self.name_to_entry.insert(name.to_owned(), (false, idx));
         }
 
         #[inline]
         pub fn add_subdir(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let idx = self.sub_dirs.len();
-            let entry = SubdirectoryEntry::new(metadata);
+            let entry = DirectoryEntry::new(metadata);
 
             self.sub_dirs.push(entry);
             self.sub_dir_names.push(name.to_owned());
-            self.name_to_entry.insert(name.to_owned(), (true, idx));
         }
 
         pub fn add_entries_batch<I>(&mut self, entries: I)
@@ -123,7 +144,6 @@ pub mod metadata {
                 self.file_names.reserve(estimated_files);
                 self.sub_dirs.reserve(estimated_dirs);
                 self.sub_dir_names.reserve(estimated_dirs);
-                self.name_to_entry.reserve(lower);
             }
 
             for (metadata, name, is_directory) in entries_iter {
@@ -135,25 +155,10 @@ pub mod metadata {
             }
         }
 
-        #[inline]
-        pub fn get_entry(&self, name: &str) -> Option<(&str, EntryType)> {
-            let &(is_dir, idx) = self.name_to_entry.get(name)?;
-
-            if is_dir {
-                let entry = self.sub_dirs.get(idx)?;
-                let name = self.sub_dir_names.get(idx)?;
-                Some((name, EntryType::Directory(*entry)))
-            } else {
-                let entry = self.files.get(idx)?;
-                let name = self.file_names.get(idx)?;
-                Some((name, EntryType::File(*entry)))
-            }
-        }
-
         pub fn get_all_entries_serialized(&self) -> Vec<u8> {
             let file_count = self.files.len();
             let dir_count = self.sub_dirs.len();
-            let capacity = Self::estimate_serialized_size(file_count + dir_count) as usize;
+            let capacity = Self::estimate_serialized_size(file_count + dir_count);
 
             let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
 
@@ -210,157 +215,153 @@ pub mod metadata {
         }
 
         #[inline]
-        pub fn get_dir_entry_serialized(&self, name: &str) -> Option<Vec<u8>> {
-            let (_name, entry) = self.get_entry(name)?;
+        fn estimate_serialized_size(count: usize) -> usize {
+            const FLATBUFFER_OVERHEAD_SIZE: usize = 128;
+            const METADATA_SIZE: usize = 64;
 
-            let capacity = Self::estimate_single_entry_size();
-            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
-
-            let (size, created, modified, accessed, is_directory) = match entry {
-                EntryType::File(f) => (f.size, f.created, f.modified, f.accessed, false),
-                EntryType::Directory(d) => (0, d.created, d.modified, d.accessed, true),
-            };
-
-            let dir_entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
-                &mut builder,
-                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-                    size,
-                    created,
-                    modified,
-                    accessed,
-                    directory: is_directory,
-                },
-            );
-
-            builder.finish(dir_entry, None);
-            Some(builder.finished_data().to_vec())
-        }
-
-        #[inline]
-        fn estimate_serialized_size(count: usize) -> u64 {
-            const FLATBUFFER_OVERHEAD: u64 = 128;
-            const METADATA_SIZE: u64 = 64;
-
-            (METADATA_SIZE + crate::utils::windows::file::WINDOWS_MAX_PATH) * count as u64
-                + FLATBUFFER_OVERHEAD
-        }
-
-        #[inline]
-        fn estimate_single_entry_size() -> usize {
-            128
+            (METADATA_SIZE + crate::utils::windows::file::WINDOWS_MAX_PATH as usize) * count
+                + FLATBUFFER_OVERHEAD_SIZE
         }
     }
 
     pub async fn handle_fs_events(
         events: &Vec<notify_debouncer_full::DebouncedEvent>,
-        meta_cache: &scc::HashCache<
+        directory_cache: &moka::future::Cache<
             std::path::PathBuf,
-            (std::sync::Arc<DirectoryLookupContext>, tokio::time::Instant),
+            std::sync::Arc<DirectoryLookupContext>,
         >,
+        file_cache: &moka::future::Cache<std::path::PathBuf, EntryType>,
     ) {
+        let mut paths_to_invalidate = std::collections::HashSet::new();
+        let mut parents_to_invalidate = std::collections::HashSet::new();
+        let mut prefix_patterns = Vec::new();
+        let mut needs_full_invalidation = false;
+
         for event in events {
+            crate::log_trace!("Processing file watch event: {:?}", event);
+
             match event.kind {
                 notify_debouncer_full::notify::EventKind::Create(_) => {
-                    debug_assert_eq!(event.paths.len(), 1);
-
-                    crate::log_trace!("file watch event info: {:?}", event);
-
-                    let Some(path) = event.paths.first() else {
-                        continue;
-                    };
-
-                    if let Some(parent_path) = path.parent() {
-                        // Remove parent's cache entry as it will now be dirty if it exists
-                        _ = meta_cache
-                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
-                            .await;
-                    };
+                    if let Some(path) = event.paths.first()
+                        && let Some(parent_path) = path.parent()
+                    {
+                        parents_to_invalidate.insert(parent_path.to_path_buf());
+                    }
                 }
+
                 notify_debouncer_full::notify::EventKind::Remove(remove_kind) => {
-                    debug_assert_eq!(event.paths.len(), 1);
-
-                    crate::log_trace!("file watch event info: {:?}", event);
-
-                    let Some(path) = event.paths.first() else {
-                        continue;
-                    };
-
-                    if let Some(parent_path) = path.parent() {
-                        _ = meta_cache
-                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
-                            .await;
-                    }
-
-                    match remove_kind {
-                        notify_debouncer_full::notify::event::RemoveKind::File => {
-                            _ = meta_cache
-                                .remove_if_async(path, |entry| event.time > entry.1.into())
-                                .await;
+                    if let Some(path) = event.paths.first() {
+                        // Always invalidate parent directory
+                        if let Some(parent_path) = path.parent() {
+                            parents_to_invalidate.insert(parent_path.to_path_buf());
                         }
-                        notify_debouncer_full::notify::event::RemoveKind::Folder => {
-                            meta_cache
-                                .retain_async(|key, value| {
-                                    // Keep if the key is outside the path
-                                    if !key.starts_with(path) {
-                                        return true;
-                                    }
 
-                                    // Keep if the entry timestamp is newer than the event's
-                                    if event.time <= value.1.into() {
-                                        return true;
-                                    }
-
-                                    // Otherwise, remove it
-                                    false
-                                })
-                                .await;
+                        match remove_kind {
+                            notify_debouncer_full::notify::event::RemoveKind::File => {
+                                paths_to_invalidate.insert(path.clone());
+                            }
+                            notify_debouncer_full::notify::event::RemoveKind::Folder => {
+                                // For folder removal, we need prefix-based invalidation
+                                prefix_patterns.push(path.clone());
+                            }
+                            _ => {
+                                // Conservative approach for unknown remove types
+                                prefix_patterns.push(path.clone());
+                            }
                         }
-                        _ => {}
                     }
                 }
-                notify_debouncer_full::notify::EventKind::Modify(_) => {
-                    crate::log_trace!("file watch event info: {:?}", event);
 
-                    let Some(path) = event.paths.first() else {
-                        continue;
-                    };
+                notify_debouncer_full::notify::EventKind::Modify(modify_kind) => {
+                    if let Some(path) = event.paths.first() {
+                        // Always invalidate parent directory
+                        if let Some(parent_path) = path.parent() {
+                            parents_to_invalidate.insert(parent_path.to_path_buf());
+                        }
 
-                    if let Some(parent_path) = path.parent() {
-                        _ = meta_cache
-                            .remove_if_async(parent_path, |entry| event.time > entry.1.into())
-                            .await;
+                        match modify_kind {
+                            notify_debouncer_full::notify::event::ModifyKind::Name(_) => {
+                                // Rename operations - invalidate both old and new paths if available
+                                prefix_patterns.push(path.clone());
+                            }
+                            notify_debouncer_full::notify::event::ModifyKind::Data(_) => {
+                                // File content changes - only invalidate the specific file
+                                paths_to_invalidate.insert(path.clone());
+                            }
+                            notify_debouncer_full::notify::event::ModifyKind::Metadata(_) => {
+                                // Metadata changes - invalidate file and potentially parent
+                                paths_to_invalidate.insert(path.clone());
+                            }
+                            _ => {
+                                // Conservative fallback
+                                prefix_patterns.push(path.clone());
+                            }
+                        }
                     }
-
-                    // this is ugly but since we have no file/directory context it'll have to do
-                    meta_cache
-                        .retain_async(|key, value| {
-                            // Keep if the key is outside the path
-                            if !key.starts_with(path) {
-                                return true;
-                            }
-
-                            // Keep if the entry timestamp is newer than the event's
-                            if event.time <= value.1.into() {
-                                return true;
-                            }
-
-                            // Otherwise, remove it
-                            false
-                        })
-                        .await;
                 }
+
                 notify_debouncer_full::notify::EventKind::Other => {
-                    crate::log_trace!("file watch event info: {:?}", event);
                     if event.need_rescan() {
-                        crate::log_warn!("file watch rescan flag received, cache invalidated");
-                        meta_cache.clear_async().await;
-                        return;
+                        crate::log_warn!(
+                            "File watch rescan flag received, full cache invalidation required"
+                        );
+                        needs_full_invalidation = true;
+                        break; // No need to process other events if full invalidation needed
                     }
                 }
+
                 _ => {
-                    crate::log_trace!("file watch event info: {:?}", event);
+                    crate::log_trace!("Unhandled event type: {:?}", event.kind);
                 }
             }
+        }
+
+        // Early return for full invalidation
+        if needs_full_invalidation {
+            directory_cache.invalidate_all();
+            file_cache.invalidate_all();
+            return;
+        }
+
+        // Batch execute invalidations
+        execute_invalidations(
+            directory_cache,
+            file_cache,
+            paths_to_invalidate,
+            parents_to_invalidate,
+            prefix_patterns,
+        )
+        .await;
+    }
+
+    async fn execute_invalidations(
+        directory_cache: &moka::future::Cache<
+            std::path::PathBuf,
+            std::sync::Arc<DirectoryLookupContext>,
+        >,
+        file_cache: &moka::future::Cache<std::path::PathBuf, EntryType>,
+        direct_paths: std::collections::HashSet<std::path::PathBuf>,
+        parent_paths: std::collections::HashSet<std::path::PathBuf>,
+        prefix_patterns: Vec<std::path::PathBuf>,
+    ) {
+        let mut all_paths = direct_paths;
+        all_paths.extend(parent_paths);
+
+        for path in &all_paths {
+            directory_cache.invalidate(path).await;
+            file_cache.invalidate(path).await;
+        }
+
+        if !prefix_patterns.is_empty() {
+            let prefixes = prefix_patterns.clone();
+            let _ = directory_cache.invalidate_entries_if(move |key, _| {
+                prefixes.iter().any(|prefix| key.starts_with(prefix))
+            });
+
+            let prefixes = prefix_patterns;
+            let _ = file_cache.invalidate_entries_if(move |key, _| {
+                prefixes.iter().any(|prefix| key.starts_with(prefix))
+            });
         }
     }
 }
