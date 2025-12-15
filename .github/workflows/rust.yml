@@ -99,7 +99,7 @@ jobs:
 
     - name: Upload binary artifact
       if: github.ref == 'refs/heads/master'
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v6
       with:
         name: server-rs-${{ matrix.feature }}-x86_64-unknown-linux-musl
         path: target/x86_64-unknown-linux-musl/release/server-rs
