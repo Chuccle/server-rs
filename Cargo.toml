@@ -19,7 +19,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["fs", "rt-multi-thread"] }
 notify-debouncer-full = "0.7.0"
 tower-http = { version = "0.6.8", features = ["fs"] }
-moka = {  version = "0.12.12", features = ["future"] }
+moka = {  version = "0.12.13", features = ["future"] }
 
 [dev-dependencies]
 tempfile = "3.24.0"
