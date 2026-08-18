@@ -18,7 +18,3 @@ pub mod time {
         }
     }
 }
-
-pub mod file {
-    pub const WINDOWS_MAX_PATH: u16 = 260;
-}

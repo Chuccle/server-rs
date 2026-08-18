@@ -3,6 +3,30 @@ name = "server-rs"
 version = "0.2.1"
 edition = "2024"
 
+# Single source of truth for lint levels: unlike `#![deny(...)]`, this applies
+# to every target in the package (lib, bin, examples, benches) rather than
+# only whichever crate root happens to carry the attribute - main.rs,
+# examples/loadgen.rs and benches/hot_path.rs are each their own crate root,
+# and were silently exempt from `clippy::pedantic` before this existed.
+#
+# `nursery` (unstable, still-being-tuned lints) and `restriction` (a grab-bag
+# clippy's own docs say to never enable as a whole group, since entries
+# actively contradict each other and normal Rust style) are deliberately left
+# at their default `allow`.
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Fires on any duplicate version anywhere in the resolved dependency graph,
+# which for a nontrivial tree is normal and outside this crate's control.
+multiple_crate_versions = "allow"
+# Publishing metadata (description, license, repository, ...) for a private
+# server binary that is never published to crates.io.
+cargo_common_metadata = "allow"
+# Every accessor here returns a value, and it is public only so `benches/`
+# can reach it; tagging each one individually would be noise without signal.
+must_use_candidate = "allow"
+
 [features]
 default = [ "stats" ]
 logging = ["dep:log", "dep:env_logger", "dep:dotenvy"]
@@ -13,18 +37,57 @@ axum = "0.8.9"
 dotenvy = { version = "0.15.7", optional = true }
 env_logger = { version = "0.11.10", optional = true }
 flatbuffers = "25.12.19"
+# Already in the tree via axum/hyper/tower-http; naming them directly lets the
+# cache hand out refcounted response bodies and pre-render file headers.
+bytes = "1.11.1"
+httpdate = "1.0.3"
+http-range-header = "0.4.2"
+mime_guess = "2.0.5"
 log = { version = "0.4.29", optional = true }
-serde =  { version = "1.0.228", features = ["derive"]}
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["fs", "rt-multi-thread"] }
+# Every one of these is used directly by the library or the binary; relying on
+# a transitive dependency to switch them on is how a build breaks when an
+# unrelated crate drops a feature.
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 notify-debouncer-full = "0.7.0"
-tower-http = { version = "0.6.8", features = ["fs"] }
+tower-http = { version = "0.7.0", features = ["fs"] }
 moka = {  version = "0.12.15", features = ["future"] }
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["rt", "macros", "test-util"] }
+# `net`/`io-util`/`time` are for examples/loadgen.rs, which drives the server
+# over a real socket rather than through the tower stack.
+tokio = { version = "1.52.3", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "test-util",
+    "net",
+    "io-util",
+    "time",
+] }
 http-body-util = "0.1.0"
 tower = { version = "0.5.3", features = ["util"] }
 futures = "0.3"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+# Benchmarks are meaningless against a debug build, and the release profile is
+# what ships - so measure that, with enough debug info for `perf` to symbolise.
+[profile.release]
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
 
