@@ -1,367 +1,839 @@
-pub mod metadata {
+//! The server's cache tier.
+//!
+//! # Shape
+//!
+//! Three caches, each answering a question the others cannot:
+//!
+//! * `resolved` - request key to canonical path. This is the one that removes
+//!   `canonicalize` from the hot path. The previous design keyed its caches by
+//!   canonical path, so every request had to pay a `canonicalize` syscall
+//!   *before* it could even look for a cache hit.
+//! * `dirs` - canonical directory path to a scanned [`DirNode`], holding the
+//!   listing already encoded as `FlatBuffers`.
+//! * `contents` - canonical file path to its bytes, for files small enough to
+//!   hold resident.
+//!
+//! There is deliberately no per-entry metadata cache. A directory's listing
+//! already contains every child's metadata, so single-entry lookups read out of
+//! the parent's node instead of storing the same facts under a second key.
+//!
+//! # Cost of a warm request
+//!
+//! Two hash lookups and a refcount bump. No syscalls, no blocking-pool hop, no
+//! re-serialisation, no allocation proportional to directory size.
+//!
+//! # Staleness
+//!
+//! Successful resolutions are cached; failures never are, so a rejected path is
+//! re-validated from scratch every time. The filesystem watcher drops
+//! resolutions whose canonical path sits at or under anything created, removed
+//! or renamed, and every entry is additionally bounded by TTL.
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct FileEntry {
-        size: u64,
-        created: u64,
-        modified: u64,
-        accessed: u64,
+use crate::error::AppError;
+// See `crate::utils::hash` for why these caches do not use the default hasher.
+use crate::utils::hash::RandomState;
+use crate::utils::{flat, meta::RawMeta, path};
+use bytes::Bytes;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Whether a response was assembled without touching the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Cache,
+    Filesystem,
+}
+
+impl Origin {
+    /// A response only counts as a hit if *every* lookup behind it was one.
+    ///
+    /// `#[must_use]` because dropping the result silently mis-records the
+    /// combined outcome as whichever side happened to be evaluated last.
+    #[must_use]
+    #[inline]
+    pub fn and(self, other: Self) -> Self {
+        if self == Self::Cache && other == Self::Cache {
+            Self::Cache
+        } else {
+            Self::Filesystem
+        }
+    }
+}
+
+/// Cache sizing.
+///
+/// Budgets are in bytes rather than entry counts: a listing for a 50k-file
+/// directory and one for an empty directory are not the same thing to hold, and
+/// an entry-count bound lets the former blow up the heap.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    pub time_to_live: std::time::Duration,
+    pub time_to_idle: std::time::Duration,
+    /// Budget for resolved paths and directory listings.
+    pub metadata_bytes: u64,
+    /// Budget for resident file contents.
+    pub content_bytes: u64,
+    /// Files above this size are streamed from disk instead of held resident.
+    pub max_resident_file_bytes: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            time_to_live: std::time::Duration::from_mins(5),
+            time_to_idle: std::time::Duration::from_mins(1),
+            metadata_bytes: 256 * 1024 * 1024,
+            content_bytes: 512 * 1024 * 1024,
+            max_resident_file_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// `u32` offsets are widened here rather than with `as`, which keeps the
+/// truncation lints happy. On a 64-bit target it compiles to nothing.
+#[inline]
+fn widen(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// A scanned directory, laid out for the only two questions asked of it: "give
+/// me the whole listing" and "give me one child's metadata".
+///
+/// # Layout
+///
+/// Nothing here is a per-entry allocation. Names are one contiguous string
+/// addressed by a compressed-row offset array, and the lookup index is a dense
+/// sorted `u64` array so that a binary search walks a handful of sequential
+/// cache lines instead of chasing a string pointer at every probe.
+///
+/// `metas` stays row-major rather than being split field-by-field, because both
+/// of its access patterns want whole rows: a child lookup reads exactly one
+/// [`RawMeta`] (a single cache line), and the listing that reads every field of
+/// every row is encoded once here and never walked again. Splitting it would
+/// turn one cache line into four.
+pub struct DirNode {
+    listing: Bytes,
+    own: RawMeta,
+
+    /// Child names concatenated in name order.
+    names: Box<str>,
+    /// `names[offsets[i]..offsets[i + 1]]` is child `i`. Length is `n + 1`.
+    offsets: Box<[u32]>,
+    /// Child metadata, in the same order as `offsets`.
+    metas: Box<[RawMeta]>,
+
+    /// Child name hashes in ascending order - the array the search actually
+    /// probes.
+    hashes: Box<[u64]>,
+    /// `slots[i]` is the child index whose name hashes to `hashes[i]`.
+    slots: Box<[u32]>,
+
+    weight: u32,
+}
+
+/// Below this many entries, thread-spawn overhead costs more than the
+/// syscalls it would save. Chosen from measurement, not a guess: see
+/// `dir_node/scan` in `benches/hot_path.rs` and the note in `BENCHMARKING.md`.
+const PARALLEL_STAT_THRESHOLD: usize = 512;
+
+/// Entries per worker below which another worker isn't worth starting.
+const MIN_CHUNK: usize = 128;
+
+/// `DirEntry::metadata` is one `statx` each, and for a large directory that
+/// dominates a cold scan - independent syscalls on unrelated files, run one at
+/// a time on a single blocking-pool thread. Fanning them out over
+/// `std::thread::scope` lets the kernel service them concurrently instead.
+///
+/// Plain threads rather than a `rayon`/tokio dependency: this runs once per
+/// cache miss, already inside `spawn_blocking`, and needs nothing beyond
+/// "run N closures, join them" - not a dependency's work-stealing scheduler.
+fn stat_children(entries: &[std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
+    fn stat_one(entry: &std::fs::DirEntry) -> Option<(Box<str>, RawMeta)> {
+        // The schema carries UTF-8 names, and a non-UTF-8 name could not be
+        // addressed through a query string either.
+        let name = entry.file_name().into_string().ok()?;
+        let metadata = entry.metadata().ok()?;
+
+        Some((name.into_boxed_str(), RawMeta::from_std(&metadata)))
     }
 
-    impl FileEntry {
-        #[inline]
-        pub fn new(metadata: &std::fs::Metadata) -> Self {
-            Self {
-                size: metadata.len(),
-                created: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .created()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-                modified: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .modified()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-                accessed: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .accessed()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
+    // Below the threshold, stay on a single pass with no further syscalls:
+    // `available_parallelism` is `sched_getaffinity` under the hood, and
+    // under this environment's virtualization that alone was measured to
+    // cost more than scanning a small directory outright (see
+    // `dir_node/scan` before/after in `BENCHMARKING.md`).
+    if entries.len() < PARALLEL_STAT_THRESHOLD {
+        return entries.iter().filter_map(stat_one).collect();
+    }
+
+    let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let chunk_count = (entries.len() / MIN_CHUNK).clamp(1, workers);
+
+    if chunk_count <= 1 {
+        return entries.iter().filter_map(stat_one).collect();
+    }
+
+    let chunk_size = entries.len().div_ceil(chunk_count);
+
+    std::thread::scope(|scope| {
+        entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || chunk.iter().filter_map(stat_one).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            // A worker can only fail by panicking, which already unwinds the
+            // process in a `spawn_blocking` context - nothing here downgrades
+            // that into a silently dropped directory chunk.
+            .flat_map(|worker| worker.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
+impl DirNode {
+    /// Read a directory and encode everything the hot path will ever need.
+    ///
+    /// Blocking: one `metadata` call plus one `read_dir` walk. The sort and the
+    /// listing encode happen here so that no request ever pays for them.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NotFound`] if `path` is not a directory, plus the usual I/O
+    /// mappings if it cannot be read.
+    pub fn scan(path: &Path) -> Result<Self, AppError> {
+        let own_metadata = std::fs::metadata(path)?;
+
+        if !own_metadata.is_dir() {
+            return Err(AppError::NotFound);
+        }
+
+        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        let mut children = stat_children(&entries);
+
+        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        let listing = flat::listing(&children);
+
+        let mut names = String::with_capacity(children.iter().map(|(name, _)| name.len()).sum());
+        let mut offsets = Vec::with_capacity(children.len() + 1);
+        let mut metas = Vec::with_capacity(children.len());
+        let mut index = Vec::with_capacity(children.len());
+
+        offsets.push(0);
+
+        for (position, (name, meta)) in children.iter().enumerate() {
+            names.push_str(name);
+            offsets.push(u32::try_from(names.len()).unwrap_or(u32::MAX));
+            metas.push(*meta);
+            index.push((
+                crate::utils::hash::name(name),
+                u32::try_from(position).unwrap_or(u32::MAX),
+            ));
+        }
+
+        // Sorting by hash lets the lookup binary-search a dense scalar array.
+        // Names stay in name order so the listing above is stable.
+        index.sort_unstable_by_key(|&(hash, _)| hash);
+
+        let mut hashes = Vec::with_capacity(index.len());
+        let mut slots = Vec::with_capacity(index.len());
+        for (hash, position) in index {
+            hashes.push(hash);
+            slots.push(position);
+        }
+
+        let footprint = listing.len()
+            + names.len()
+            + offsets.len() * size_of::<u32>()
+            + metas.len() * size_of::<RawMeta>()
+            + hashes.len() * size_of::<u64>()
+            + slots.len() * size_of::<u32>();
+
+        Ok(Self {
+            listing,
+            own: RawMeta::from_std(&own_metadata),
+            names: names.into_boxed_str(),
+            offsets: offsets.into_boxed_slice(),
+            metas: metas.into_boxed_slice(),
+            hashes: hashes.into_boxed_slice(),
+            slots: slots.into_boxed_slice(),
+            weight: u32::try_from(footprint).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// The pre-encoded listing. Cloning a [`Bytes`] is a refcount bump.
+    #[inline]
+    pub fn listing(&self) -> Bytes {
+        self.listing.clone()
+    }
+
+    /// This directory's own metadata.
+    #[inline]
+    pub fn own(&self) -> RawMeta {
+        self.own
+    }
+
+    /// Metadata for one child, by its exact on-disk name.
+    ///
+    /// Callers pass the name taken from a canonical path, which already carries
+    /// the on-disk spelling, so an exact comparison is correct even on
+    /// case-insensitive filesystems.
+    pub fn child(&self, name: &str) -> Option<RawMeta> {
+        let wanted = crate::utils::hash::name(name);
+        let mut probe = self.hashes.partition_point(|hash| *hash < wanted);
+
+        // Equal hashes sit next to each other, so a collision costs a short
+        // forward scan. The name comparison is what settles it.
+        while self.hashes.get(probe) == Some(&wanted) {
+            let child = widen(*self.slots.get(probe)?);
+
+            if self.name_of(child) == Some(name) {
+                return self.metas.get(child).copied();
             }
-        }
-    }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct DirectoryEntry {
-        created: u64,
-        modified: u64,
-        accessed: u64,
-    }
-
-    impl DirectoryEntry {
-        #[inline]
-        pub fn new(metadata: &std::fs::Metadata) -> Self {
-            Self {
-                created: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .created()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-                modified: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .modified()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-                accessed: crate::utils::windows::time::IntoFileTime::into_file_time(
-                    metadata
-                        .accessed()
-                        .unwrap_or_else(|_| std::time::SystemTime::now()),
-                ),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub enum EntryType {
-        File(FileEntry),
-        Directory(DirectoryEntry),
-    }
-
-    impl EntryType {
-        #[inline]
-        pub fn get_dir_entry_serialized(&self) -> Vec<u8> {
-            let capacity = 64;
-            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
-
-            let (size, created, modified, accessed, is_directory) = match self {
-                EntryType::File(f) => (f.size, f.created, f.modified, f.accessed, false),
-                EntryType::Directory(d) => (0, d.created, d.modified, d.accessed, true),
-            };
-
-            let dir_entry = crate::generated::blorg_meta_flat::DirectoryEntryMetadata::create(
-                &mut builder,
-                &crate::generated::blorg_meta_flat::DirectoryEntryMetadataArgs {
-                    size,
-                    created,
-                    modified,
-                    accessed,
-                    directory: is_directory,
-                },
-            );
-
-            builder.finish(dir_entry, None);
-            builder.finished_data().to_vec()
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct DirectoryLookupContext {
-        files: Vec<FileEntry>,
-        file_names: Vec<String>,
-        sub_dirs: Vec<DirectoryEntry>,
-        sub_dir_names: Vec<String>,
-    }
-
-    impl DirectoryLookupContext {
-        pub fn new() -> Self {
-            Self {
-                files: Vec::new(),
-                file_names: Vec::new(),
-                sub_dirs: Vec::new(),
-                sub_dir_names: Vec::new(),
-            }
+            probe += 1;
         }
 
-        #[inline]
-        pub fn add_file(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let entry = FileEntry::new(metadata);
+        None
+    }
 
-            self.files.push(entry);
-            self.file_names.push(name.to_owned());
+    fn name_of(&self, child: usize) -> Option<&str> {
+        let start = widen(*self.offsets.get(child)?);
+        let end = widen(*self.offsets.get(child + 1)?);
+
+        self.names.get(start..end)
+    }
+}
+
+/// A file held resident in memory, with its response headers pre-rendered so
+/// that serving it is a handful of `HeaderValue` refcount bumps.
+pub struct FileNode {
+    pub data: Bytes,
+    pub len: u64,
+    /// Truncated to whole seconds so it compares cleanly against an
+    /// `If-Modified-Since`, which only has second granularity.
+    pub modified: Option<std::time::SystemTime>,
+    pub content_type: axum::http::HeaderValue,
+    pub last_modified: Option<axum::http::HeaderValue>,
+    pub etag: Option<axum::http::HeaderValue>,
+}
+
+/// What the file endpoint should do with a resolved path.
+#[derive(Clone)]
+pub enum Content {
+    /// Small enough to answer entirely from memory.
+    Resident(Arc<FileNode>),
+    /// Too large to hold resident; stream it off disk. Cached as a decision so
+    /// the size check is not repeated on every request.
+    Streamed,
+}
+
+type PathCache<V> = moka::future::Cache<PathBuf, V, RandomState>;
+type KeyCache<V> = moka::future::Cache<String, V, RandomState>;
+
+pub struct Store {
+    base: PathBuf,
+    config: Config,
+    resolved: KeyCache<Arc<Path>>,
+    dirs: PathCache<Arc<DirNode>>,
+    contents: PathCache<Content>,
+}
+
+/// Rough fixed cost of one resolution entry: two allocations plus the cache's
+/// own bookkeeping.
+const RESOLVED_OVERHEAD: u32 = 96;
+
+/// Nominal weight of a "stream this one" decision, which holds no data.
+const STREAMED_WEIGHT: u32 = 64;
+
+impl Store {
+    /// # Errors
+    ///
+    /// Propagates the I/O error if `base` cannot be canonicalised. Every
+    /// containment check downstream compares against the canonical form, so
+    /// this has to happen exactly once, here.
+    pub fn new(base: &Path, config: Config) -> std::io::Result<Self> {
+        let base = std::fs::canonicalize(base)?;
+
+        let resolved = moka::future::Cache::builder()
+            .max_capacity(config.metadata_bytes)
+            .weigher(|key: &String, value: &Arc<Path>| {
+                let bytes = key.len() + value.as_os_str().len();
+                u32::try_from(bytes)
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(RESOLVED_OVERHEAD)
+            })
+            .time_to_live(config.time_to_live)
+            .time_to_idle(config.time_to_idle)
+            .build_with_hasher(RandomState::default());
+
+        let dirs = moka::future::Cache::builder()
+            .max_capacity(config.metadata_bytes)
+            .weigher(|_: &PathBuf, value: &Arc<DirNode>| value.weight)
+            .time_to_live(config.time_to_live)
+            .time_to_idle(config.time_to_idle)
+            .build_with_hasher(RandomState::default());
+
+        let contents = moka::future::Cache::builder()
+            .max_capacity(config.content_bytes)
+            .weigher(|_: &PathBuf, value: &Content| match value {
+                Content::Resident(node) => u32::try_from(node.data.len()).unwrap_or(u32::MAX),
+                Content::Streamed => STREAMED_WEIGHT,
+            })
+            .time_to_live(config.time_to_live)
+            .time_to_idle(config.time_to_idle)
+            .build_with_hasher(RandomState::default());
+
+        Ok(Self {
+            base,
+            config,
+            resolved,
+            dirs,
+            contents,
+        })
+    }
+
+    #[inline]
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// Serialised listing for a directory.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, or an unreadable directory.
+    pub async fn directory_listing(&self, raw: &str) -> Result<(Bytes, Origin), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, resolved) = self.resolve(&key).await?;
+        let (node, scanned) = self.dir_node(&canonical).await?;
+
+        Ok((node.listing(), resolved.and(scanned)))
+    }
+
+    /// Serialised metadata for a single entry.
+    ///
+    /// Read out of the parent directory's node rather than a cache of its own.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, or permission denied.
+    pub async fn entry_metadata(&self, raw: &str) -> Result<(Bytes, Origin), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, resolved) = self.resolve(&key).await?;
+
+        // The served root has no parent inside the tree, so it answers for
+        // itself out of its own node.
+        if *canonical == *self.base {
+            let (node, scanned) = self.dir_node(&canonical).await?;
+            return Ok((flat::entry(&node.own()), resolved.and(scanned)));
         }
 
-        #[inline]
-        pub fn add_subdir(&mut self, metadata: &std::fs::Metadata, name: &str) {
-            let entry = DirectoryEntry::new(metadata);
-
-            self.sub_dirs.push(entry);
-            self.sub_dir_names.push(name.to_owned());
-        }
-
-        pub fn add_entries_batch<I>(&mut self, entries: I)
-        where
-            I: IntoIterator<Item = (std::fs::Metadata, String, bool)>,
+        if let Some(parent) = canonical.parent()
+            && let Some(name) = canonical.file_name().and_then(std::ffi::OsStr::to_str)
+            && let Ok((node, scanned)) = self.dir_node(parent).await
+            && let Some(meta) = node.child(name)
         {
-            let entries_iter = entries.into_iter();
-
-            // Pre-allocate if we have size hints
-            if let (lower, Some(_upper)) = entries_iter.size_hint() {
-                let estimated_files = lower / 2; // rough estimate
-                let estimated_dirs = lower - estimated_files;
-
-                self.files.reserve(estimated_files);
-                self.file_names.reserve(estimated_files);
-                self.sub_dirs.reserve(estimated_dirs);
-                self.sub_dir_names.reserve(estimated_dirs);
-            }
-
-            for (metadata, name, is_directory) in entries_iter {
-                if is_directory {
-                    self.add_subdir(&metadata, &name);
-                } else {
-                    self.add_file(&metadata, &name);
-                }
-            }
+            return Ok((flat::entry(&meta), resolved.and(scanned)));
         }
 
-        pub fn get_all_entries_serialized(&self) -> Vec<u8> {
-            let file_count = self.files.len();
-            let dir_count = self.sub_dirs.len();
-            let capacity = Self::estimate_serialized_size(file_count + dir_count);
+        // Either the parent could not be listed, or the entry appeared after it
+        // was scanned and the watcher has not caught up yet. Stat directly
+        // rather than hide a readable entry behind an unreadable or stale
+        // parent.
+        let target = canonical.to_path_buf();
+        let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(target)).await??;
 
-            let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(capacity);
+        Ok((
+            flat::entry(&RawMeta::from_std(&metadata)),
+            Origin::Filesystem,
+        ))
+    }
 
-            let dir_metadata: Vec<_> = self
-                .sub_dirs
-                .iter()
-                .zip(self.sub_dir_names.iter())
-                .map(|(entry, name)| {
-                    let name_fb = builder.create_string(name);
-                    crate::generated::blorg_meta_flat::SubdirectoryMetadata::create(
-                        &mut builder,
-                        &crate::generated::blorg_meta_flat::SubdirectoryMetadataArgs {
-                            name: Some(name_fb),
-                            accessed: entry.accessed,
-                            modified: entry.modified,
-                            created: entry.created,
-                        },
-                    )
-                })
-                .collect();
+    /// Resolve a file request and decide how to serve it.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, or permission denied.
+    pub async fn file_content(&self, raw: &str) -> Result<(Arc<Path>, Content, Origin), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, resolved) = self.resolve(&key).await?;
 
-            let file_metadata: Vec<_> = self
-                .files
-                .iter()
-                .zip(self.file_names.iter())
-                .map(|(entry, name)| {
-                    let name_fb = builder.create_string(name);
-                    crate::generated::blorg_meta_flat::FileEntryMetadata::create(
-                        &mut builder,
-                        &crate::generated::blorg_meta_flat::FileEntryMetadataArgs {
-                            name: Some(name_fb),
-                            size: entry.size,
-                            accessed: entry.accessed,
-                            modified: entry.modified,
-                            created: entry.created,
-                        },
-                    )
-                })
-                .collect();
-
-            let directories_vector = builder.create_vector(&dir_metadata);
-            let files_vector = builder.create_vector(&file_metadata);
-
-            let directory = crate::generated::blorg_meta_flat::Directory::create(
-                &mut builder,
-                &crate::generated::blorg_meta_flat::DirectoryArgs {
-                    subdirectories: Some(directories_vector),
-                    files: Some(files_vector),
-                },
-            );
-
-            builder.finish(directory, None);
-            builder.finished_data().to_vec()
+        if let Some(content) = self.contents.get(&*canonical).await {
+            return Ok((canonical, content, resolved));
         }
 
-        #[inline]
-        fn estimate_serialized_size(count: usize) -> usize {
-            const FLATBUFFER_OVERHEAD_SIZE: usize = 128;
-            const METADATA_SIZE: usize = 64;
+        let cache_key = canonical.to_path_buf();
+        let load_path = cache_key.clone();
+        let limit = self.config.max_resident_file_bytes;
 
-            (METADATA_SIZE + crate::utils::windows::file::WINDOWS_MAX_PATH as usize) * count
-                + FLATBUFFER_OVERHEAD_SIZE
+        let content = self
+            .contents
+            .try_get_with(cache_key, async move {
+                tokio::task::spawn_blocking(move || load_content(&load_path, limit))
+                    .await
+                    .map_err(AppError::from)?
+            })
+            .await?;
+
+        Ok((canonical, content, Origin::Filesystem))
+    }
+
+    /// Request key to canonical path, coalescing concurrent cold lookups so a
+    /// thundering herd costs one `canonicalize` rather than one each.
+    ///
+    /// Only successes are cached, which keeps an "allowed" verdict from
+    /// outliving the symlink topology that justified it.
+    async fn resolve(&self, key: &str) -> Result<(Arc<Path>, Origin), AppError> {
+        if let Some(canonical) = self.resolved.get(key).await {
+            return Ok((canonical, Origin::Cache));
+        }
+
+        let base = self.base.clone();
+        let owned = key.to_owned();
+        let resolve_key = owned.clone();
+
+        let canonical = self
+            .resolved
+            .try_get_with(owned, async move {
+                let resolved = tokio::task::spawn_blocking(move || {
+                    path::resolve_blocking(&base, &resolve_key)
+                })
+                .await??;
+
+                Ok::<Arc<Path>, AppError>(Arc::from(resolved))
+            })
+            .await?;
+
+        Ok((canonical, Origin::Filesystem))
+    }
+
+    async fn dir_node(&self, canonical: &Path) -> Result<(Arc<DirNode>, Origin), AppError> {
+        if let Some(node) = self.dirs.get(canonical).await {
+            return Ok((node, Origin::Cache));
+        }
+
+        let cache_key = canonical.to_path_buf();
+        let scan_path = cache_key.clone();
+
+        let node = self
+            .dirs
+            .try_get_with(cache_key, async move {
+                let node = tokio::task::spawn_blocking(move || DirNode::scan(&scan_path)).await??;
+
+                Ok::<Arc<DirNode>, AppError>(Arc::new(node))
+            })
+            .await?;
+
+        Ok((node, Origin::Filesystem))
+    }
+
+    /// Drop everything. Used when the watcher reports it lost track of events.
+    pub fn invalidate_all(&self) {
+        self.resolved.invalidate_all();
+        self.dirs.invalidate_all();
+        self.contents.invalidate_all();
+    }
+
+    /// A file's bytes changed but its position in the tree did not: drop its
+    /// contents and the parent listing that quotes its size and timestamps.
+    /// Resolutions stay valid, so this is O(1) and leaves the hot path warm.
+    pub async fn invalidate_content(&self, path: &Path) {
+        self.contents.invalidate(path).await;
+
+        if let Some(parent) = path.parent() {
+            self.dirs.invalidate(parent).await;
         }
     }
 
-    pub async fn handle_fs_events(
-        events: &Vec<notify_debouncer_full::DebouncedEvent>,
-        directory_cache: &moka::future::Cache<
-            std::path::PathBuf,
-            std::sync::Arc<DirectoryLookupContext>,
-        >,
-        file_cache: &moka::future::Cache<std::path::PathBuf, EntryType>,
-    ) {
-        let mut paths_to_invalidate = std::collections::HashSet::new();
-        let mut parents_to_invalidate = std::collections::HashSet::new();
-        let mut prefix_patterns = Vec::new();
-        let mut needs_full_invalidation = false;
+    /// The tree itself moved. Renames and directory removals relocate whole
+    /// subtrees, so anything that resolved at or *through* one of `roots` has to
+    /// go - including resolutions, which can only be matched on the canonical
+    /// path they produced, since their keys are request strings.
+    pub async fn invalidate_subtree(&self, roots: Vec<PathBuf>) {
+        for root in &roots {
+            self.dirs.invalidate(root).await;
+            self.contents.invalidate(root).await;
 
-        for event in events {
-            crate::log_trace!("Processing file watch event: {:?}", event);
-
-            match event.kind {
-                notify_debouncer_full::notify::EventKind::Create(_) => {
-                    if let Some(path) = event.paths.first()
-                        && let Some(parent_path) = path.parent()
-                    {
-                        parents_to_invalidate.insert(parent_path.to_path_buf());
-                    }
-                }
-
-                notify_debouncer_full::notify::EventKind::Remove(remove_kind) => {
-                    if let Some(path) = event.paths.first() {
-                        // Always invalidate parent directory
-                        if let Some(parent_path) = path.parent() {
-                            parents_to_invalidate.insert(parent_path.to_path_buf());
-                        }
-
-                        match remove_kind {
-                            notify_debouncer_full::notify::event::RemoveKind::File => {
-                                paths_to_invalidate.insert(path.clone());
-                            }
-                            notify_debouncer_full::notify::event::RemoveKind::Folder => {
-                                // For folder removal, we need prefix-based invalidation
-                                prefix_patterns.push(path.clone());
-                            }
-                            _ => {
-                                // Conservative approach for unknown remove types
-                                prefix_patterns.push(path.clone());
-                            }
-                        }
-                    }
-                }
-
-                notify_debouncer_full::notify::EventKind::Modify(modify_kind) => {
-                    if let Some(path) = event.paths.first() {
-                        // Always invalidate parent directory
-                        if let Some(parent_path) = path.parent() {
-                            parents_to_invalidate.insert(parent_path.to_path_buf());
-                        }
-
-                        match modify_kind {
-                            notify_debouncer_full::notify::event::ModifyKind::Name(_) => {
-                                // Rename operations - invalidate both old and new paths if available
-                                prefix_patterns.push(path.clone());
-                            }
-                            notify_debouncer_full::notify::event::ModifyKind::Data(_) => {
-                                // File content changes - only invalidate the specific file
-                                paths_to_invalidate.insert(path.clone());
-                            }
-                            notify_debouncer_full::notify::event::ModifyKind::Metadata(_) => {
-                                // Metadata changes - invalidate file and potentially parent
-                                paths_to_invalidate.insert(path.clone());
-                            }
-                            _ => {
-                                // Conservative fallback
-                                prefix_patterns.push(path.clone());
-                            }
-                        }
-                    }
-                }
-
-                notify_debouncer_full::notify::EventKind::Other => {
-                    if event.need_rescan() {
-                        crate::log_warn!(
-                            "File watch rescan flag received, full cache invalidation required"
-                        );
-                        needs_full_invalidation = true;
-                        break; // No need to process other events if full invalidation needed
-                    }
-                }
-
-                _ => {
-                    crate::log_trace!("Unhandled event type: {:?}", event.kind);
-                }
+            if let Some(parent) = root.parent() {
+                self.dirs.invalidate(parent).await;
             }
         }
 
-        // Early return for full invalidation
-        if needs_full_invalidation {
-            directory_cache.invalidate_all();
-            file_cache.invalidate_all();
+        // `invalidate_entries_if` would do this same prefix sweep, but
+        // opting into it (`support_invalidation_closures`) taxes every single
+        // `get()` on every cache tier - measured at 5-13% on the warm path,
+        // to support a predicate call that only ever runs here, on the rare,
+        // off-hot-path event of a directory actually moving. `iter()` needs
+        // no such opt-in: same sweep, paid only when a structural event
+        // actually happens.
+        for (key, _) in &self.dirs {
+            if roots.iter().any(|root| key.starts_with(root.as_path())) {
+                self.dirs.invalidate(&*key).await;
+            }
+        }
+
+        for (key, _) in &self.contents {
+            if roots.iter().any(|root| key.starts_with(root.as_path())) {
+                self.contents.invalidate(&*key).await;
+            }
+        }
+
+        for (key, value) in &self.resolved {
+            if roots.iter().any(|root| value.starts_with(root)) {
+                self.resolved.invalidate(&*key).await;
+            }
+        }
+    }
+}
+
+/// Probes and targeted invalidation the server itself never needs, but that
+/// tests use to assert on cache state directly.
+#[cfg(test)]
+impl Store {
+    /// Forget one directory's listing.
+    pub async fn invalidate_directory(&self, canonical: &Path) {
+        self.dirs.invalidate(canonical).await;
+    }
+
+    /// Whether a directory listing is currently resident.
+    ///
+    /// Unlike a `get`, this does not count as an access, so it will not reset
+    /// the entry's idle timer.
+    pub fn has_directory(&self, canonical: &Path) -> bool {
+        self.dirs.contains_key(canonical)
+    }
+
+    /// Whether a file's contents are currently resident.
+    pub fn has_content(&self, canonical: &Path) -> bool {
+        self.contents.contains_key(canonical)
+    }
+
+    /// The `time_to_live`/`time_to_idle` each cache tier was actually built
+    /// with, for asserting that [`Config`] reaches every one of them.
+    ///
+    /// This is the only thing about expiration this crate can test: `moka`
+    /// reads `std::time::Instant::now()` internally rather than through
+    /// `tokio::time`, so its clock is not mockable from outside the crate, and
+    /// actually observing an expiry deterministically is not possible without
+    /// a real sleep. Configuration wiring is instant and fully within our
+    /// control, so that is what gets asserted on.
+    pub fn policies(&self) -> [moka::policy::Policy; 3] {
+        [
+            self.resolved.policy(),
+            self.dirs.policy(),
+            self.contents.policy(),
+        ]
+    }
+}
+
+/// Open once, then decide from the handle's own metadata whether to hold the
+/// file resident. Reading metadata off the open handle rather than the path
+/// saves a syscall and closes the window where the path could change underneath
+/// us.
+fn load_content(path: &Path, limit: u64) -> Result<Content, AppError> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+
+    if metadata.is_dir() {
+        return Err(AppError::NotFound);
+    }
+
+    if metadata.len() > limit {
+        return Ok(Content::Streamed);
+    }
+
+    let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut data)?;
+
+    // Trust what was actually read over what the metadata claimed.
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    let modified = metadata.modified().ok().map(truncate_to_seconds);
+
+    let content_type = axum::http::HeaderValue::from_str(
+        mime_guess::from_path(path).first_or_octet_stream().as_ref(),
+    )
+    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
+
+    let last_modified = modified
+        .map(httpdate::fmt_http_date)
+        .and_then(|date| axum::http::HeaderValue::from_str(&date).ok());
+
+    // Strong validator over the two things that change when the bytes do.
+    let ticks = RawMeta::from_std(&metadata).modified;
+    let etag = axum::http::HeaderValue::from_str(&format!("\"{len:x}-{ticks:x}\"")).ok();
+
+    Ok(Content::Resident(Arc::new(FileNode {
+        data: Bytes::from(data),
+        len,
+        modified,
+        content_type,
+        last_modified,
+        etag,
+    })))
+}
+
+fn truncate_to_seconds(time: std::time::SystemTime) -> std::time::SystemTime {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map_or(time, |since| {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(since.as_secs())
+        })
+}
+
+/// Translate a debounced batch of filesystem events into cache invalidations.
+///
+/// Events are split by what they actually invalidate. Content changes are the
+/// common case and stay O(1); only structural changes - which can move whole
+/// subtrees - pay for a predicate sweep.
+pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], store: &Store) {
+    use notify_debouncer_full::notify::EventKind;
+    use notify_debouncer_full::notify::event::ModifyKind;
+
+    let mut content_changes: HashSet<PathBuf> = HashSet::new();
+    let mut structural: Vec<PathBuf> = Vec::new();
+
+    for event in events {
+        crate::log_trace!("Processing file watch event: {:?}", event);
+
+        if event.need_rescan() {
+            crate::log_warn!("File watch rescan flag received, dropping all cached state");
+            store.invalidate_all();
             return;
         }
 
-        // Batch execute invalidations
-        execute_invalidations(
-            directory_cache,
-            file_cache,
-            paths_to_invalidate,
-            parents_to_invalidate,
-            prefix_patterns,
-        )
-        .await;
+        match event.kind {
+            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
+                content_changes.extend(event.paths.iter().cloned());
+            }
+
+            // Creates, removes and renames all change what a path *means*, and
+            // a rename event carries both the old and the new path.
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
+                structural.extend(event.paths.iter().cloned());
+            }
+
+            _ => {
+                crate::log_trace!("Unhandled event type: {:?}", event.kind);
+            }
+        }
     }
 
-    async fn execute_invalidations(
-        directory_cache: &moka::future::Cache<
-            std::path::PathBuf,
-            std::sync::Arc<DirectoryLookupContext>,
-        >,
-        file_cache: &moka::future::Cache<std::path::PathBuf, EntryType>,
-        direct_paths: std::collections::HashSet<std::path::PathBuf>,
-        parent_paths: std::collections::HashSet<std::path::PathBuf>,
-        prefix_patterns: Vec<std::path::PathBuf>,
-    ) {
-        let mut all_paths = direct_paths;
-        all_paths.extend(parent_paths);
+    for path in &content_changes {
+        store.invalidate_content(path).await;
+    }
 
-        for path in &all_paths {
-            directory_cache.invalidate(path).await;
-            file_cache.invalidate(path).await;
+    if !structural.is_empty() {
+        store.invalidate_subtree(structural).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a directory and scan it, so the index under test is the one the
+    /// server would actually hold.
+    fn scanned(names: &[&str], dirs: &[&str]) -> (tempfile::TempDir, DirNode) {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        for name in names {
+            std::fs::write(temp.path().join(name), *name).expect("write");
+        }
+        for name in dirs {
+            std::fs::create_dir(temp.path().join(name)).expect("mkdir");
         }
 
-        if !prefix_patterns.is_empty() {
-            let prefixes = prefix_patterns.clone();
-            let _ = directory_cache.invalidate_entries_if(move |key, _| {
-                prefixes.iter().any(|prefix| key.starts_with(prefix))
-            });
+        let node = DirNode::scan(temp.path()).expect("scan");
+        (temp, node)
+    }
 
-            let prefixes = prefix_patterns;
-            let _ = file_cache.invalidate_entries_if(move |key, _| {
-                prefixes.iter().any(|prefix| key.starts_with(prefix))
-            });
+    #[test]
+    fn every_child_is_findable_with_its_own_metadata() {
+        let files = ["a.txt", "b.txt", "zzz.bin", "with space.md", "файл.txt"];
+        let (_temp, node) = scanned(&files, &["sub", "another"]);
+
+        for name in files {
+            let meta = node.child(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert!(!meta.is_dir, "{name} should be a file");
+            // Each file was written with its own name as contents.
+            let expected = u64::try_from(name.len()).expect("length fits");
+            assert_eq!(meta.size, expected, "wrong size for {name}");
+        }
+
+        for name in ["sub", "another"] {
+            let meta = node.child(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert!(meta.is_dir, "{name} should be a directory");
+        }
+    }
+
+    #[test]
+    fn absent_names_miss_rather_than_returning_a_neighbour() {
+        // A hash-ordered index has no notion of "nearby", so a miss must not
+        // land on whatever happens to sit at the partition point.
+        let (_temp, node) = scanned(&["a.txt", "b.txt"], &[]);
+
+        for name in ["", "a", "a.tx", "a.txtt", "c.txt", "A.TXT", "zzz"] {
+            assert!(node.child(name).is_none(), "{name:?} should not be found");
+        }
+    }
+
+    #[test]
+    fn a_directory_with_many_children_stays_consistent() {
+        // Enough entries that the binary search does real work, and enough to
+        // shake out an off-by-one in the offset array.
+        let names: Vec<String> = (0..512).map(|i| format!("entry_{i:04}.dat")).collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (_temp, node) = scanned(&borrowed, &[]);
+
+        for name in &names {
+            assert!(node.child(name).is_some(), "missing {name}");
+        }
+        assert!(node.child("entry_9999.dat").is_none());
+    }
+
+    #[test]
+    fn the_empty_directory_has_no_children() {
+        let (_temp, node) = scanned(&[], &[]);
+
+        assert!(node.child("anything").is_none());
+        assert!(node.child("").is_none());
+        assert!(node.own().is_dir);
+    }
+
+    #[test]
+    fn scanning_a_file_is_not_found() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("plain.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        // `DirNode` has no `PartialEq`, so match on the error rather than the
+        // whole `Result`.
+        match DirNode::scan(&file) {
+            Err(error) => assert_eq!(error, AppError::NotFound),
+            Ok(_) => panic!("scanning a plain file should not produce a listing"),
+        }
+    }
+
+    #[test]
+    fn configured_durations_reach_every_cache_tier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let config = Config {
+            time_to_live: std::time::Duration::from_secs(42),
+            time_to_idle: std::time::Duration::from_secs(7),
+            ..Config::default()
+        };
+
+        let store = Store::new(temp.path(), config).expect("store");
+
+        for policy in store.policies() {
+            assert_eq!(policy.time_to_live(), Some(config.time_to_live));
+            assert_eq!(policy.time_to_idle(), Some(config.time_to_idle));
         }
     }
 }

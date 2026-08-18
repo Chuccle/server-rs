@@ -9,9 +9,7 @@ fn main() {
         .status()
         .expect("Failed to execute flatc. Make sure it's installed and in your PATH");
 
-    if !flatc_status.success() {
-        panic!("flatc command failed");
-    }
+    assert!(flatc_status.success(), "flatc command failed");
 
     // Compile the FlatBuffer schema
     let schema_path = schemas_dir.join("metadata_flatbuffer.fbs");
@@ -20,9 +18,7 @@ fn main() {
         .status()
         .expect("Failed to execute flatc command");
 
-    if !status.success() {
-        panic!("flatc compilation failed");
-    }
+    assert!(status.success(), "flatc compilation failed");
 
     // Make cargo watch for changes in schema files
     println!("cargo:rerun-if-changed=src/schemas/metadata_flatbuffer.fbs");

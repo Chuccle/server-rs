@@ -1,3 +1,9 @@
+//! Hit/miss counters.
+//!
+//! A "hit" means the response was assembled without touching the filesystem -
+//! see [`crate::utils::cache::Origin`]. Both counters compile away entirely
+//! when the `stats` feature is off.
+
 #[derive(Default)]
 pub struct Cache {
     #[cfg(feature = "stats")]
@@ -9,6 +15,15 @@ pub struct Cache {
 impl Cache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record exactly one outcome per request.
+    #[inline]
+    pub fn record(&self, origin: crate::utils::cache::Origin) {
+        match origin {
+            crate::utils::cache::Origin::Cache => self.increment_hits(),
+            crate::utils::cache::Origin::Filesystem => self.increment_misses(),
+        }
     }
 
     #[cfg(feature = "stats")]
