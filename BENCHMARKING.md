@@ -12,6 +12,32 @@ usual way to "prove" a change that did nothing.
 Always measure a release build. A debug build's numbers are unrelated to
 anything that ships.
 
+## Pin the server and the load generator to disjoint cores
+
+The generator is itself a multi-threaded Tokio program. Run unpinned on the
+same box, it and the server each spawn one worker per CPU and then fight over
+the same cores - so you measure the contention, not the server.
+
+```bash
+taskset -c 0-5  ./target/release/server-rs /path/to/corpus &
+taskset -c 6-11 ./target/release/examples/loadgen --target '/get_dir_info?path=big'
+```
+
+How much this matters, measured: unpinned, the server peaked at ~145k req/s
+with Tokio's default worker count and ~174k when hand-limited to 6 workers,
+which looked like a 20% tuning win. Pinned to six dedicated cores, the default
+reached ~196k - matching the hand-tuned figure exactly, because
+`available_parallelism()` reads the affinity mask and Tokio's default is
+already "one worker per available core". The apparent 20% was the co-location
+artifact, not a tunable. There is nothing to configure here: Tokio's default
+respects both CPU affinity and cgroup quotas, so a container with `--cpus=2`
+gets two workers without being told.
+
+Worth knowing in the other direction too - oversubscription is expensive.
+Forcing 12 workers onto 6 available cores cost 27% throughput against the
+6-worker default. If you ever set `TOKIO_WORKER_THREADS` by hand, you are
+most likely making it worse.
+
 ## Throughput
 
 `loadgen` speaks HTTP over a socket and knows nothing about the crate, so the
