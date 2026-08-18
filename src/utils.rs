@@ -1,4 +1,9 @@
 pub mod cache;
+pub mod flat;
+pub mod hash;
+pub mod http;
 pub mod logging;
+pub mod meta;
+pub mod path;
 pub mod stats;
 pub mod windows;
