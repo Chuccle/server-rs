@@ -35,15 +35,12 @@ const fn avalanche(mut value: u64) -> u64 {
 #[inline]
 pub fn name(name: &str) -> u64 {
     let mut state = MIX;
-    let mut chunks = name.as_bytes().chunks_exact(8);
+    let (chunks, remainder) = name.as_bytes().as_chunks::<8>();
 
-    for chunk in &mut chunks {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        state = (state ^ u64::from_le_bytes(word)).wrapping_mul(MIX).rotate_left(31);
+    for chunk in chunks {
+        state = (state ^ u64::from_le_bytes(*chunk)).wrapping_mul(MIX).rotate_left(31);
     }
 
-    let remainder = chunks.remainder();
     if !remainder.is_empty() {
         let mut word = [0u8; 8];
         word[..remainder.len()].copy_from_slice(remainder);
@@ -60,15 +57,12 @@ pub struct Hasher {
 impl std::hash::Hasher for Hasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
+        let (chunks, remainder) = bytes.as_chunks::<8>();
 
-        for chunk in &mut chunks {
-            let mut word = [0u8; 8];
-            word.copy_from_slice(chunk);
-            self.absorb(u64::from_le_bytes(word));
+        for chunk in chunks {
+            self.absorb(u64::from_le_bytes(*chunk));
         }
 
-        let remainder = chunks.remainder();
         if !remainder.is_empty() {
             let mut word = [0u8; 8];
             word[..remainder.len()].copy_from_slice(remainder);
@@ -88,7 +82,7 @@ impl std::hash::Hasher for Hasher {
 
 impl Hasher {
     #[inline]
-    fn absorb(&mut self, word: u64) {
+    const fn absorb(&mut self, word: u64) {
         self.state = (self.state ^ word).wrapping_mul(MIX).rotate_left(31);
     }
 }

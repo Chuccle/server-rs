@@ -18,6 +18,7 @@ impl Cache {
     }
 
     /// Record exactly one outcome per request.
+    #[cfg(feature = "stats")]
     #[inline]
     pub fn record(&self, origin: crate::utils::cache::Origin) {
         match origin {
@@ -26,13 +27,20 @@ impl Cache {
         }
     }
 
+    /// Record exactly one outcome per request.
+    #[cfg(not(feature = "stats"))]
+    #[inline]
+    pub const fn record(&self, origin: crate::utils::cache::Origin) {
+        let _ = (self, origin);
+    }
+
     #[cfg(feature = "stats")]
     pub fn increment_hits(&self) {
         self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(not(feature = "stats"))]
-    pub fn increment_hits(&self) {
+    pub const fn increment_hits(&self) {
         let _ = self;
     }
 
@@ -43,7 +51,7 @@ impl Cache {
     }
 
     #[cfg(not(feature = "stats"))]
-    pub fn increment_misses(&self) {
+    pub const fn increment_misses(&self) {
         let _ = self;
     }
 

@@ -21,11 +21,13 @@ pub mod utils;
 
 use error::AppError;
 
-/// Pulls `path` straight out of the query string, bypassing
-/// `axum::extract::Query`'s `serde`-deserialise pipeline - a derive-generated
-/// visitor, field-name matching, and an unconditional `String` allocation for
-/// the value, none of which a single required field needs. Borrows from `uri`
-/// whenever the value has no percent-escapes, which is the common case.
+/// Extracts the required `path` query parameter from `uri`'s query string.
+///
+/// This bypasses `axum::extract::Query`'s `serde`-deserialise pipeline - a
+/// derive-generated visitor, field-name matching, and an unconditional
+/// `String` allocation for the value, none of which a single required field
+/// needs. Borrows from `uri` whenever the value has no percent-escapes, which
+/// is the common case.
 ///
 /// # Errors
 ///
@@ -248,6 +250,8 @@ pub fn resolve_base_path(argument: &str) -> std::path::PathBuf {
     }
 }
 
+/// Watches `path` recursively, feeding file-system events to the cache.
+///
 /// `path` must be the canonical root: `notify` builds event paths by joining
 /// the watched root with the on-disk name, so watching the canonical form is
 /// what makes event paths line up with the cache keys they invalidate.
