@@ -70,8 +70,8 @@ pub fn listing(children: &[(Box<str>, RawMeta)]) -> Bytes {
     let mut files = Vec::with_capacity(children.len());
 
     for (name, meta) in children {
+        let name_offset = builder.create_string(name);
         if meta.is_dir {
-            let name_offset = builder.create_string(name);
             subdirectories.push(fb::SubdirectoryMetadata::create(
                 &mut builder,
                 &fb::SubdirectoryMetadataArgs {
@@ -82,7 +82,6 @@ pub fn listing(children: &[(Box<str>, RawMeta)]) -> Bytes {
                 },
             ));
         } else {
-            let name_offset = builder.create_string(name);
             files.push(fb::FileEntryMetadata::create(
                 &mut builder,
                 &fb::FileEntryMetadataArgs {
