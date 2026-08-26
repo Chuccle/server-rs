@@ -18,12 +18,22 @@ impl Cache {
     }
 
     /// Record exactly one outcome per request.
+    ///
+    /// With the `stats` feature off this method still exists so callers
+    /// compile unchanged, but its body is empty - after inlining there is
+    /// no call left for the optimiser to discard.
     #[cfg(feature = "stats")]
     #[inline]
     pub fn record(&self, origin: crate::utils::cache::Origin) {
         match origin {
-            crate::utils::cache::Origin::Cache => self.increment_hits(),
-            crate::utils::cache::Origin::Filesystem => self.increment_misses(),
+            crate::utils::cache::Origin::Cache => {
+                self.hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            crate::utils::cache::Origin::Filesystem => {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -32,27 +42,6 @@ impl Cache {
     #[inline]
     pub const fn record(&self, origin: crate::utils::cache::Origin) {
         let _ = (self, origin);
-    }
-
-    #[cfg(feature = "stats")]
-    pub fn increment_hits(&self) {
-        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(not(feature = "stats"))]
-    pub const fn increment_hits(&self) {
-        let _ = self;
-    }
-
-    #[cfg(feature = "stats")]
-    pub fn increment_misses(&self) {
-        self.misses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(not(feature = "stats"))]
-    pub const fn increment_misses(&self) {
-        let _ = self;
     }
 
     #[cfg(feature = "stats")]
