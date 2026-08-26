@@ -272,7 +272,7 @@ impl DirNode {
 
     /// This directory's own metadata.
     #[inline]
-    pub fn own(&self) -> RawMeta {
+    pub const fn own(&self) -> RawMeta {
         self.own
     }
 

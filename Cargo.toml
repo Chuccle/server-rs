@@ -9,14 +9,14 @@ edition = "2024"
 # examples/loadgen.rs and benches/hot_path.rs are each their own crate root,
 # and were silently exempt from `clippy::pedantic` before this existed.
 #
-# `nursery` (unstable, still-being-tuned lints) and `restriction` (a grab-bag
-# clippy's own docs say to never enable as a whole group, since entries
-# actively contradict each other and normal Rust style) are deliberately left
-# at their default `allow`.
+# `restriction` (a grab-bag clippy's own docs say to never enable as a whole
+# group, since entries actively contradict each other and normal Rust style)
+# is deliberately left at its default `allow`; `nursery` is enabled below.
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
 # Fires on any duplicate version anywhere in the resolved dependency graph,
 # which for a nontrivial tree is normal and outside this crate's control.
 multiple_crate_versions = "allow"
