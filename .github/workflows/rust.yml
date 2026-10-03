@@ -103,3 +103,65 @@ jobs:
       with:
         name: server-rs-${{ matrix.feature }}-x86_64-unknown-linux-musl
         path: target/x86_64-unknown-linux-musl/release/server-rs
+  # BlorgFS packages this server for Windows next to the driver, cross-built
+  # from Linux for x86_64-pc-windows-gnu from the commit it pins. Build and
+  # lint that exact target here, so a change that breaks it fails in this
+  # repository rather than in the next package bump.
+  windows:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: |
+        echo "is_dependabot=false" >> $GITHUB_OUTPUT
+        if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+          echo "is_dependabot=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v7
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      run: echo "flatc_hash=$(git -C buildtools/flatbuffers rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Cache Flatc build
+      id: cache_flatc
+      uses: actions/cache@v6
+      with:
+        path: ~/flatc
+        key: ${{ runner.os }}-flatc-bin-${{ steps.flatc_hash.outputs.flatc_hash }}
+
+    - name: Build Flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
+      run: |
+        cmake -S buildtools/flatbuffers -B "$RUNNER_TEMP/flatc-build" -DCMAKE_BUILD_TYPE=Release \
+          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
+        cmake --build "$RUNNER_TEMP/flatc-build" --target flatc -j
+        mkdir -p ~/flatc && cp "$RUNNER_TEMP/flatc-build/flatc" ~/flatc/
+
+    - name: Install the cross toolchain
+      run: |
+        echo "$HOME/flatc" >> $GITHUB_PATH
+        sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        rustup target add x86_64-pc-windows-gnu
+
+    - name: Build release binary
+      run: cargo build --release --locked --target x86_64-pc-windows-gnu
+
+    - name: Clippy
+      run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
