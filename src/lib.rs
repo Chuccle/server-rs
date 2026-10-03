@@ -2040,9 +2040,9 @@ mod tests {
             }
 
             // Root (or anything holding CAP_DAC_OVERRIDE) reads a mode-000
-            // directory regardless, so there is no denial to observe. Cloud
-            // agent sandboxes and containers typically run tests as root; the
-            // test can say nothing there, rather than fail on the setup.
+            // directory regardless, so there is no denial to observe.
+            // Containers typically run tests as root; the test can say
+            // nothing there, rather than fail on the setup.
             if fs::read_dir(&restricted_dir).is_ok() {
                 fs::set_permissions(
                     &restricted_dir,
