@@ -36,10 +36,8 @@ cargo clippy --locked --all-targets -- -D warnings
   `cargo clippy --locked --release --target x86_64-pc-windows-msvc --lib --bins -- -D warnings`.
   Leave out `--all-targets`: the benches pull in criterion, whose `alloca`
   dependency compiles C with MSVC's `lib.exe`.
-- A Windows binary for iterating: `cargo build --release --target
-  x86_64-pc-windows-gnu` (needs mingw-w64), or `cargo xwin build --release
-  --target x86_64-pc-windows-msvc` where the session can reach Microsoft's
-  download CDN. The package always ships the MSVC build from CI.
+- The Windows binary is built only by BlorgFS's `build.yml`, the one
+  recipe for the package (see below).
 - Cloud sessions usually run as root, which ignores file permissions.
   `test_permission_denied` detects that and reports it instead of failing.
 
