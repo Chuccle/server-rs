@@ -103,3 +103,68 @@ jobs:
       with:
         name: server-rs-${{ matrix.feature }}-x86_64-unknown-linux-musl
         path: target/x86_64-unknown-linux-musl/release/server-rs
+  # BlorgFS packages this server for Windows (its build.yml pins this repo as
+  # third_party/server-rs and ships server-rs.exe next to the driver), so a
+  # change that breaks the Windows build has to fail here, before a package
+  # bump picks it up. Build and compile the tests, including the cfg(windows)
+  # branches in them; the Linux matrix above remains the test gate.
+  windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v7
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      shell: pwsh
+      run: echo "flatc_hash=$(git -C buildtools/flatbuffers rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+    - name: Cache flatc build
+      id: cache_flatc
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}\flatc
+        key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
+
+    - name: Build flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $build = Join-Path $env:RUNNER_TEMP 'flatc-build'
+        cmake -S buildtools/flatbuffers -B $build `
+          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
+        if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
+        cmake --build $build --config Release --target flatc
+        if ($LASTEXITCODE -ne 0) { throw "flatc build failed with exit code $LASTEXITCODE" }
+        $dest = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'flatc')
+        Copy-Item (Join-Path $build 'Release\flatc.exe') $dest
+
+    - name: Put flatc on PATH
+      shell: pwsh
+      run: echo (Join-Path $env:RUNNER_TEMP 'flatc') >> $env:GITHUB_PATH
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build release binary
+      run: cargo build --release --locked
+
+    - name: Compile tests
+      run: cargo test --locked --no-run
