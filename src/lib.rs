@@ -2039,6 +2039,22 @@ mod tests {
                 fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
             }
 
+            // Root (or anything holding CAP_DAC_OVERRIDE) reads a mode-000
+            // directory regardless, so there is no denial to observe.
+            // Containers typically run tests as root; the test can say
+            // nothing there, rather than fail on the setup.
+            if fs::read_dir(&restricted_dir).is_ok() {
+                fs::set_permissions(
+                    &restricted_dir,
+                    <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+                )
+                .unwrap();
+                eprintln!(
+                    "test_permission_denied: permissions are not enforced for this user (root?); nothing to test"
+                );
+                return;
+            }
+
             let app = Router::new()
                 .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
                 .with_state(state);
