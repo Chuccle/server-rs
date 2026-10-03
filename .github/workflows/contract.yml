@@ -1,0 +1,111 @@
+name: Contract
+
+# Checks this server against the wire contract it shares with the BlorgFS
+# driver (schemas/contract.json). The structural half -- routes, fixtures,
+# framing over a real socket -- runs as ordinary unit tests in rust.yml
+# (src/contract_tests.rs). This workflow adds the two things cargo test
+# cannot: that every behaviour this server is responsible for has a test,
+# and that a release build of the server passes the same live probe the
+# Windows test guest runs.
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: |
+        echo "is_dependabot=false" >> $GITHUB_OUTPUT
+        if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+          echo "is_dependabot=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v7
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    # Against the contract this commit pins, so adding a behaviour to the
+    # contract makes the server's next schemas bump fail until it is tested.
+    - name: Every behaviour server-rs checks has a test
+      run: python3 schemas/tools/check_traceability.py --checker server-rs --root src
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-contract-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      run: echo "flatc_hash=$(git -C buildtools/flatbuffers rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Cache flatc build
+      id: cache_flatc
+      uses: actions/cache@v6
+      with:
+        path: ~/flatc
+        key: ${{ runner.os }}-flatc-bin-${{ steps.flatc_hash.outputs.flatc_hash }}
+
+    - name: Build flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
+      run: |
+        cmake -S buildtools/flatbuffers -B "$RUNNER_TEMP/flatc-build" -DCMAKE_BUILD_TYPE=Release \
+          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
+        cmake --build "$RUNNER_TEMP/flatc-build" --target flatc -j
+        mkdir -p ~/flatc && cp "$RUNNER_TEMP/flatc-build/flatc" ~/flatc/
+
+    - name: Put flatc on PATH
+      run: echo "$HOME/flatc" >> $GITHUB_PATH
+
+    - name: Build release server
+      run: cargo build --release --locked
+
+    # The same script the Windows test guest runs against a deployed server.
+    # -SeedRoot lets it create its probe tree and run the change tests (B08).
+    - name: Live conformance probe
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'served')
+        $env:PORT = '18080'
+        $server = Start-Process -FilePath ./target/release/server-rs -ArgumentList $root.FullName -PassThru `
+          -RedirectStandardOutput server.log -RedirectStandardError server.err
+        try {
+          $deadline = (Get-Date).AddSeconds(30)
+          do {
+            Start-Sleep -Milliseconds 250
+            try { $ready = (Invoke-WebRequest http://127.0.0.1:18080/healthcheck -UseBasicParsing).StatusCode -eq 200 } catch { $ready = $false }
+          } until ($ready -or $server.HasExited -or (Get-Date) -gt $deadline)
+          if (-not $ready) { throw "server-rs did not become healthy (exited: $($server.HasExited))" }
+
+          ./schemas/conformance/Test-BlorgContract.ps1 -Server 127.0.0.1:18080 -SeedRoot $root.FullName -ResultPath contract-results.json
+          if ($LASTEXITCODE -ne 0) { throw "$LASTEXITCODE contract check(s) failed" }
+        } finally {
+          Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          Get-Content server.err -ErrorAction SilentlyContinue | Select-Object -Last 50 | Write-Host
+        }
+
+    - name: Upload probe results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: contract-results
+        path: contract-results.json
+        if-no-files-found: ignore

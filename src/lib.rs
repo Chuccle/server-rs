@@ -16,6 +16,24 @@ mod generated {
         "/metadata_flatbuffer_generated.rs"
     ));
 }
+/// The wire contract shared with the `BlorgFS` driver, generated from
+/// `schemas/contract.json`. Routes and the query key are taken from here, so
+/// renaming one without changing the contract (and so the driver) does not
+/// compile; `contract_tests` checks the rest of it against a live socket.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unreadable_literal
+)]
+pub mod contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/generated/blorg_contract.rs"
+    ));
+}
+#[cfg(test)]
+mod contract_tests;
 pub mod error;
 pub mod utils;
 
@@ -38,7 +56,9 @@ pub fn extract_path(uri: &axum::http::Uri) -> Result<std::borrow::Cow<'_, str>, 
     let query = uri.query().unwrap_or("");
 
     for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("path=") {
+        if let Some((key, value)) = pair.split_once('=')
+            && key == contract::QUERY_PATH
+        {
             return percent_encoding::percent_decode_str(value)
                 .decode_utf8()
                 .map_err(|_| AppError::BadRequest);
@@ -145,16 +165,18 @@ pub async fn get_file_handler(
 /// Every route the server serves, in one place, so that tests and benchmarks
 /// exercise the same wiring as production.
 pub fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
+    use contract::route;
+
     axum::Router::new()
         .route(
-            "/get_dir_entry_info",
+            route::DIR_ENTRY_INFO,
             axum::routing::get(get_dir_entry_info_handler),
         )
-        .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
-        .route("/get_file", axum::routing::get(get_file_handler))
-        .route("/get_file", axum::routing::head(get_file_handler))
+        .route(route::DIR_INFO, axum::routing::get(get_dir_info_handler))
+        .route(route::FILE, axum::routing::get(get_file_handler))
+        .route(route::FILE, axum::routing::head(get_file_handler))
         .route(
-            "/healthcheck",
+            route::HEALTHCHECK,
             axum::routing::get(|| async { axum::http::StatusCode::OK }),
         )
         .with_state(state)

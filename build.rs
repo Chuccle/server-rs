@@ -20,6 +20,10 @@ fn main() {
 
     assert!(status.success(), "flatc compilation failed");
 
-    // Make cargo watch for changes in schema files
-    println!("cargo:rerun-if-changed=src/schemas/metadata_flatbuffer.fbs");
+    // Rerun only when the schema changes. The previous path pointed at
+    // `src/schemas/`, which does not exist - and cargo treats a missing
+    // rerun-if-changed path as always stale, so this ran on every build.
+    // The contract module (`schemas/generated/blorg_contract.rs`) needs no
+    // entry here: it is pulled in by `include!`, which rustc tracks itself.
+    println!("cargo:rerun-if-changed={}", schema_path.display());
 }
