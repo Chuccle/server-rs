@@ -2620,6 +2620,77 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn an_entry_without_one_names_what_it_inherits() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            assert_eq!(put(&state, "test_dir", &LOCKED).await, http::StatusCode::NO_CONTENT);
+
+            let entry = get(&state, "/get_dir_entry_info?path=test_dir/file_in_dir.txt").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert!(entry.security().is_none());
+            assert_eq!(entry.inherited().unwrap().bytes(), LOCKED);
+            assert_eq!(entry.inherited_depth(), 1);
+
+            let path = "test_dir/nested_test_dir/file_in_nested_test_dir.txt";
+            let entry = get(&state, &format!("/get_dir_entry_info?path={path}")).await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert_eq!(entry.inherited().unwrap().bytes(), LOCKED);
+            assert_eq!(entry.inherited_depth(), 2);
+
+            // Its own, rather than what it would inherit.
+            let entry = get(&state, "/get_dir_entry_info?path=test_dir").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert_eq!(entry.security().unwrap().bytes(), LOCKED);
+            assert!(entry.inherited().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_listing_names_what_its_directory_resolves_to() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            assert_eq!(put(&state, "test_dir", &LOCKED).await, http::StatusCode::NO_CONTENT);
+
+            let listing = get(&state, "/get_dir_info?path=test_dir").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            assert_eq!(listing.inherited().unwrap().bytes(), LOCKED);
+            assert_eq!(listing.inherited_depth(), 0);
+
+            let listing = get(&state, "/get_dir_info?path=test_dir&subtree=100").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            let nested = listing.descendants().unwrap().get(0).listing().unwrap();
+            assert_eq!(nested.inherited().unwrap().bytes(), LOCKED);
+            assert_eq!(nested.inherited_depth(), 1);
+
+            let listing = get(&state, "/get_dir_info?path=other_test_dir").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            assert!(listing.inherited().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_directory_one_drops_what_is_beneath_it() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+            state.store.feed().go_live();
+
+            get(&state, "/get_dir_info?path=test_dir/nested_test_dir").await;
+            let before = state.store.feed().current();
+
+            assert_eq!(put(&state, "test_dir", &LOCKED).await, http::StatusCode::NO_CONTENT);
+            assert!(!state.store.has_directory(&canonical(&state, "test_dir/nested_test_dir")));
+
+            let batch = state
+                .store
+                .feed()
+                .poll(state.store.feed().epoch(), before)
+                .await
+                .unwrap();
+            assert_eq!(&*batch.created, [Box::from("test_dir")]);
+            assert_eq!(batch.modified, Vec::<Box<str>>::new());
+        }
+
+        #[tokio::test]
         async fn storing_one_is_published_to_the_feed() {
             let temp = tempfile::tempdir().unwrap();
             let state = writable(temp.path());
@@ -2734,6 +2805,23 @@ mod tests {
 
             assert!(!state.store.has_content(&target));
             assert!(!state.store.has_directory(&root));
+        }
+
+        #[tokio::test]
+        async fn a_directory_s_metadata_changing_invalidates_its_subtree() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let nested = primed(&state, "test_dir/nested_test_dir").await;
+            let target = canonical(&state, "test_dir");
+
+            let events = [event(
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                &[&target],
+            )];
+
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert!(!state.store.has_directory(&nested));
         }
 
         #[tokio::test]

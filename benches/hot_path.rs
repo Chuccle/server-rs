@@ -90,7 +90,7 @@ fn bench_child_lookup(c: &mut Criterion) {
 
     for entries in SIZES {
         let temp = populated_dir(entries);
-        let node = cache::DirNode::scan(temp.path()).expect("scan");
+        let node = cache::DirNode::scan(temp.path(), temp.path()).expect("scan");
 
         // Middle of the range, so neither the first nor last probe is lucky.
         let hit = format!("entry_{:05}.dat", entries / 2);
@@ -120,7 +120,7 @@ fn bench_encode_entry(c: &mut Criterion) {
     };
 
     c.bench_function("flat/entry", |b| {
-        b.iter(|| flat::entry(black_box(&meta), None));
+        b.iter(|| flat::entry(black_box(&meta), None, None));
     });
 }
 
@@ -145,7 +145,7 @@ fn bench_scan(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(u64::try_from(entries).expect("fits")));
         group.bench_with_input(BenchmarkId::from_parameter(entries), &entries, |b, _| {
-            b.iter(|| cache::DirNode::scan(black_box(temp.path())));
+            b.iter(|| cache::DirNode::scan(black_box(temp.path()), temp.path()));
         });
     }
 

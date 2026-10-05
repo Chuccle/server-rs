@@ -41,12 +41,16 @@ thread_local! {
 /// The output has to be its own allocation regardless: slices of a shared blob
 /// would not be eight-byte aligned, which a `FlatBuffer` reader requires.
 ///
-/// `security` is the entry's own descriptor, if it has one stored.
-pub fn entry(meta: &RawMeta, security: Option<&[u8]>) -> Bytes {
+/// `security` is the entry's own descriptor, if it has one stored, and
+/// `inherited` what it inherits otherwise, with how many levels up that is.
+pub fn entry(meta: &RawMeta, security: Option<&[u8]>, inherited: Option<(&[u8], u32)>) -> Bytes {
     ENTRY_BUILDER.with_borrow_mut(|builder| {
         builder.reset();
 
         let security = security.map(|descriptor| builder.create_vector(descriptor));
+        let (inherited, inherited_depth) = inherited
+            .map(|(descriptor, depth)| (Some(builder.create_vector(descriptor)), depth))
+            .unwrap_or_default();
         let table = fb::DirectoryEntryMetadata::create(
             builder,
             &fb::DirectoryEntryMetadataArgs {
@@ -56,6 +60,8 @@ pub fn entry(meta: &RawMeta, security: Option<&[u8]>) -> Bytes {
                 accessed: meta.accessed,
                 directory: meta.is_dir,
                 security,
+                inherited,
+                inherited_depth,
             },
         );
 
@@ -70,14 +76,19 @@ pub fn entry(meta: &RawMeta, security: Option<&[u8]>) -> Bytes {
 /// `children` is expected to be sorted by name; the two output vectors keep
 /// that order, so clients see a stable listing no matter what order the OS
 /// walked the directory in. `securities` are the descriptors the children's
-/// `security` indexes name.
-pub fn listing(children: &[(Box<str>, RawMeta)], securities: &[Bytes]) -> Bytes {
+/// `security` indexes name, and `inherited` what the directory resolves to.
+pub fn listing(
+    children: &[(Box<str>, RawMeta)],
+    securities: &[Bytes],
+    inherited: Option<(&[u8], u32)>,
+) -> Bytes {
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(estimate(children, securities));
 
     let directory = directory(
         &mut builder,
         children.iter().map(|(name, meta)| (&**name, *meta)),
         securities,
+        inherited,
         None,
     );
 
@@ -103,7 +114,13 @@ pub fn subtree(root: &DirNode, descendants: &[(u32, u32, Arc<DirNode>)]) -> Byte
     let mut encoded = Vec::with_capacity(descendants.len());
 
     for (parent, subdirectory, node) in descendants {
-        let listing = directory(&mut builder, node.children(), node.securities(), None);
+        let listing = directory(
+            &mut builder,
+            node.children(),
+            node.securities(),
+            node.inherited(),
+            None,
+        );
 
         encoded.push(fb::Descendant::create(
             &mut builder,
@@ -120,6 +137,7 @@ pub fn subtree(root: &DirNode, descendants: &[(u32, u32, Arc<DirNode>)]) -> Byte
         &mut builder,
         root.children(),
         root.securities(),
+        root.inherited(),
         Some(descendants_vector),
     );
 
@@ -136,6 +154,7 @@ fn directory<'fbb, 'name>(
     builder: &mut flatbuffers::FlatBufferBuilder<'fbb>,
     children: impl Iterator<Item = (&'name str, RawMeta)>,
     securities: &[Bytes],
+    inherited: Option<(&[u8], u32)>,
     descendants: Option<Descendants<'fbb>>,
 ) -> flatbuffers::WIPOffset<fb::Directory<'fbb>> {
     let mut subdirectories = Vec::with_capacity(children.size_hint().0);
@@ -174,8 +193,9 @@ fn directory<'fbb, 'name>(
     let subdirectories_vector = builder.create_vector(&subdirectories);
     let files_vector = builder.create_vector(&files);
 
-    // Left out entirely when nothing in the directory has a descriptor, so a
-    // tree without any encodes exactly as it did before they existed.
+    // Left out entirely when nothing in or above the directory has a
+    // descriptor, so a tree without any encodes exactly as it did before
+    // they existed.
     let security = (!securities.is_empty()).then(|| {
         let tables = securities
             .iter()
@@ -193,6 +213,10 @@ fn directory<'fbb, 'name>(
         builder.create_vector(&tables)
     });
 
+    let (inherited, inherited_depth) = inherited
+        .map(|(descriptor, depth)| (Some(builder.create_vector(descriptor)), depth))
+        .unwrap_or_default();
+
     fb::Directory::create(
         builder,
         &fb::DirectoryArgs {
@@ -200,6 +224,8 @@ fn directory<'fbb, 'name>(
             files: Some(files_vector),
             descendants,
             security,
+            inherited,
+            inherited_depth,
         },
     )
 }

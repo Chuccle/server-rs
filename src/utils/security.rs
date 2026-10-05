@@ -58,6 +58,16 @@ pub fn read(path: &Path) -> Option<Bytes> {
     valid(&bytes).then(|| Bytes::from(bytes))
 }
 
+/// The descriptor of the nearest directory above `path`, up to and including
+/// `base`, that has one stored, and how many levels up it is.
+pub fn nearest_above(path: &Path, base: &Path) -> Option<(Bytes, u32)> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(base))
+        .zip(1..)
+        .find_map(|(ancestor, depth)| Some((read(ancestor)?, depth)))
+}
+
 /// Whether any child of `directory` has a descriptor of its own.
 pub fn marked(directory: &Path) -> bool {
     platform::get(directory, platform::MARK).is_some()

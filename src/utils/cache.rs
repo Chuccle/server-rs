@@ -142,6 +142,10 @@ pub struct DirNode {
     /// This directory's own stored descriptor, which only the served root is
     /// ever answered out of: every other entry is answered by its parent.
     own_security: Option<Bytes>,
+    /// What this directory resolves to: its own descriptor at depth 0, or
+    /// the nearest stored one above it and how many levels up. `None` when
+    /// none is stored up to the served root.
+    inherited: Option<(Bytes, u32)>,
     /// The distinct descriptors the children have stored, which their
     /// `security` indexes name. Empty unless the directory is marked.
     securities: Box<[Bytes]>,
@@ -247,12 +251,14 @@ impl DirNode {
     ///
     /// Blocking: one `metadata` call plus one `read_dir` walk. The sort and the
     /// listing encode happen here so that no request ever pays for them.
+    /// `base` is the served root, the highest directory a descriptor is
+    /// inherited from.
     ///
     /// # Errors
     ///
     /// [`AppError::NotFound`] if `path` is not a directory, plus the usual I/O
     /// mappings if it cannot be read.
-    pub fn scan(path: &Path) -> Result<Self, AppError> {
+    pub fn scan(path: &Path, base: &Path) -> Result<Self, AppError> {
         let own_metadata = std::fs::metadata(path)?;
 
         if !own_metadata.is_dir() {
@@ -273,7 +279,17 @@ impl DirNode {
             Vec::new()
         };
 
-        let listing = flat::listing(&children, &securities);
+        let own_security = security::read(path);
+        let inherited = own_security.as_ref().map_or_else(
+            || security::nearest_above(path, base),
+            |own| Some((own.clone(), 0)),
+        );
+
+        let listing = flat::listing(
+            &children,
+            &securities,
+            inherited.as_ref().map(|(descriptor, depth)| (&**descriptor, *depth)),
+        );
 
         let mut names = String::with_capacity(children.iter().map(|(name, _)| name.len()).sum());
         let mut offsets = Vec::with_capacity(children.len() + 1);
@@ -303,8 +319,6 @@ impl DirNode {
             slots.push(position);
         }
 
-        let own_security = security::read(path);
-
         let footprint = listing.len()
             + own_security.as_ref().map_or(0, Bytes::len)
             + securities.iter().map(Bytes::len).sum::<usize>()
@@ -318,6 +332,7 @@ impl DirNode {
             listing,
             own: RawMeta::from_std(&own_metadata),
             own_security,
+            inherited,
             securities: securities.into_boxed_slice(),
             names: names.into_boxed_str(),
             offsets: offsets.into_boxed_slice(),
@@ -344,6 +359,21 @@ impl DirNode {
     #[inline]
     pub fn own_security(&self) -> Option<&[u8]> {
         self.own_security.as_deref()
+    }
+
+    /// What a child without a descriptor of its own inherits, and from how
+    /// many levels above it.
+    #[inline]
+    pub fn inherited_by_children(&self) -> Option<(&[u8], u32)> {
+        self.inherited
+            .as_ref()
+            .map(|(descriptor, depth)| (&**descriptor, depth.saturating_add(1)))
+    }
+
+    /// What this directory resolves to, as the listing reports it.
+    #[inline]
+    pub fn inherited(&self) -> Option<(&[u8], u32)> {
+        self.inherited.as_ref().map(|(descriptor, depth)| (&**descriptor, *depth))
     }
 
     /// The descriptors the listing holds, in the order its children's
@@ -759,7 +789,7 @@ impl Store {
         if *canonical == *self.base {
             let (node, scanned, listed) = self.dir_node(&canonical).await?;
             return Ok((
-                flat::entry(&node.own(), node.own_security()),
+                flat::entry(&node.own(), node.own_security(), None),
                 resolved.and(scanned),
                 named.and(listed),
             ));
@@ -771,7 +801,11 @@ impl Store {
             && let Some(meta) = node.child(name)
         {
             return Ok((
-                flat::entry(&meta, node.security(&meta)),
+                flat::entry(
+                    &meta,
+                    node.security(&meta),
+                    node.inherited_by_children(),
+                ),
                 resolved.and(scanned),
                 named.and(listed),
             ));
@@ -783,13 +817,26 @@ impl Store {
         // parent. A stat is read after the request arrived, so it is as current
         // as the feed can promise anything to be.
         let target = canonical.to_path_buf();
-        let (metadata, descriptor) = tokio::task::spawn_blocking(move || {
-            std::fs::metadata(&target).map(|metadata| (metadata, security::read(&target)))
+        let base = self.base.clone();
+        let (metadata, descriptor, inherited) = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&target).map(|metadata| {
+                let descriptor = security::read(&target);
+                let inherited = descriptor
+                    .is_none()
+                    .then(|| security::nearest_above(&target, &base))
+                    .flatten();
+
+                (metadata, descriptor, inherited)
+            })
         })
         .await??;
 
         Ok((
-            flat::entry(&RawMeta::from_std(&metadata), descriptor.as_deref()),
+            flat::entry(
+                &RawMeta::from_std(&metadata),
+                descriptor.as_deref(),
+                inherited.as_ref().map(|(descriptor, depth)| (&**descriptor, *depth)),
+            ),
             Origin::Filesystem,
             named,
         ))
@@ -899,13 +946,14 @@ impl Store {
         } else {
             let cache_key = canonical.to_path_buf();
             let scan_path = cache_key.clone();
+            let base = self.base.clone();
             let generation = self.feed.current();
 
             let entry = self
                 .dirs
                 .try_get_with(cache_key, async move {
                     let node =
-                        tokio::task::spawn_blocking(move || DirNode::scan(&scan_path)).await??;
+                        tokio::task::spawn_blocking(move || DirNode::scan(&scan_path, &base)).await??;
 
                     Ok::<_, AppError>(Stamped::new(Arc::new(node), generation))
                 })
@@ -944,24 +992,34 @@ impl Store {
         let target = Arc::clone(&canonical);
         let written = tokio::task::spawn_blocking(move || {
             security::write(&target, descriptor.as_deref(), listed_in.as_deref())
+                .map(|()| target.is_dir())
         })
         .await
         .map_err(AppError::from)
         .and_then(|written| written.map_err(AppError::from));
 
+        let directory = written.unwrap_or(false);
+
         let _publishing = self.publishing.lock().await;
         let generation = self.feed.begin();
 
-        self.invalidate_content(&canonical).await;
+        // A directory's descriptor may be inherited by everything beneath
+        // it, so it is published as the watcher publishes a structural
+        // change, which tells a client to drop the subtree.
+        let kind = if directory {
+            self.invalidate_subtree(&[canonical.to_path_buf()]).await;
+            Kind::Created
+        } else {
+            self.invalidate_content(&canonical).await;
+            Kind::Modified
+        };
 
         match path::key_of(&self.base, &canonical) {
-            Some(key) => self
-                .feed
-                .publish(generation, vec![(key.into_boxed_str(), Kind::Modified)]),
+            Some(key) => self.feed.publish(generation, vec![(key.into_boxed_str(), kind)]),
             None => self.feed.publish_reset(generation),
         }
 
-        written
+        written.map(|_| ())
     }
 
     /// Drop everything. Used when the watcher reports it lost track of events.
@@ -1041,7 +1099,7 @@ impl Store {
     ///
     /// If `canonical` cannot be scanned.
     pub async fn plant_directory(&self, canonical: &Path, generation: u64) {
-        let node = DirNode::scan(canonical).expect("scan");
+        let node = DirNode::scan(canonical, &self.base).expect("scan");
         self.dirs
             .insert(canonical.to_path_buf(), Stamped::new(Arc::new(node), generation))
             .await;
@@ -1152,7 +1210,9 @@ fn truncate_to_seconds(time: std::time::SystemTime) -> std::time::SystemTime {
 ///
 /// Events are split by what they actually invalidate. Content changes are the
 /// common case and stay O(1); only structural changes - which can move whole
-/// subtrees - pay for a predicate sweep.
+/// subtrees - pay for a predicate sweep. A directory whose attributes changed
+/// counts as structural: its security descriptor may have changed, and
+/// everything beneath it may inherit that.
 ///
 /// The generation begins before the first invalidation and is published after
 /// the last, which is the order [`Stamped`] depends on: a load that began
@@ -1164,6 +1224,7 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
 
     let mut content_changes: HashSet<PathBuf> = HashSet::new();
     let mut structural: Vec<PathBuf> = Vec::new();
+    let mut attributes: Vec<PathBuf> = Vec::new();
 
     for event in events {
         crate::log_trace!("Processing file watch event: {:?}", event);
@@ -1178,8 +1239,12 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
         }
 
         match event.kind {
-            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
+            EventKind::Modify(ModifyKind::Data(_)) => {
                 content_changes.extend(event.paths.iter().cloned());
+            }
+
+            EventKind::Modify(ModifyKind::Metadata(_)) => {
+                attributes.extend(event.paths.iter().cloned());
             }
 
             // Creates, removes and renames all change what a path *means*, and
@@ -1190,6 +1255,35 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
 
             _ => {
                 crate::log_trace!("Unhandled event type: {:?}", event.kind);
+            }
+        }
+    }
+
+    if !attributes.is_empty() {
+        let directories = tokio::task::spawn_blocking(move || {
+            attributes
+                .into_iter()
+                .map(|path| {
+                    let directory = path.is_dir();
+                    (path, directory)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let Ok(directories) = directories else {
+            let _publishing = store.publishing.lock().await;
+            let generation = store.feed.begin();
+            store.invalidate_all();
+            store.feed.publish_reset(generation);
+            return;
+        };
+
+        for (path, directory) in directories {
+            if directory {
+                structural.push(path);
+            } else {
+                content_changes.insert(path);
             }
         }
     }
@@ -1260,7 +1354,7 @@ mod tests {
             std::fs::create_dir(temp.path().join(name)).expect("mkdir");
         }
 
-        let node = DirNode::scan(temp.path()).expect("scan");
+        let node = DirNode::scan(temp.path(), temp.path()).expect("scan");
         (temp, node)
     }
 
@@ -1325,7 +1419,7 @@ mod tests {
 
         // `DirNode` has no `PartialEq`, so match on the error rather than the
         // whole `Result`.
-        match DirNode::scan(&file) {
+        match DirNode::scan(&file, temp.path()) {
             Err(error) => assert_eq!(error, AppError::NotFound),
             Ok(_) => panic!("scanning a plain file should not produce a listing"),
         }
