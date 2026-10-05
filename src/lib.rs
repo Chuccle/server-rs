@@ -1309,6 +1309,44 @@ mod tests {
             let bytes = resp.collect().await.unwrap().to_bytes();
             assert!(bytes.is_empty());
         }
+
+        #[tokio::test]
+        async fn a_file_carries_one_entity_tag_resident_or_streamed() {
+            let temp = tempfile::tempdir().unwrap();
+            let resident = setup_test_env(temp.path());
+            let streamed = state_with_config(
+                temp.path(),
+                utils::cache::Config {
+                    max_resident_file_bytes: 0,
+                    ..utils::cache::Config::default()
+                },
+            );
+
+            let mut tags = Vec::new();
+
+            for state in [resident, streamed] {
+                let req = Request::builder()
+                    .uri("/get_file?path=test_file.txt")
+                    .header(http::header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap();
+
+                let resp = build_router(state).oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+                tags.push(resp.headers().get(http::header::ETAG).cloned().unwrap());
+            }
+
+            let since = fs::metadata(temp.path().join("test_file.txt"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            let expected = format!("\"{:x}.{:08x}-c\"", since.as_secs(), since.subsec_nanos());
+
+            assert_eq!(tags[0], expected);
+            assert_eq!(tags[1], expected);
+        }
     }
 
     mod cache {
