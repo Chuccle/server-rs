@@ -114,7 +114,14 @@ pub async fn get_dir_entry_info_handler(
     Ok(answer(encoded, freshness))
 }
 
+/// Most entries one `get_dir_info?subtree=` answer will carry, whatever the
+/// client asks for: it bounds the scanning a single request can cause.
+const SUBTREE_MAX_ENTRIES: u64 = 65_536;
+
 /// `GET /get_dir_info` - the serialised listing for a directory.
+///
+/// With `subtree=N`, the listings beneath it too, up to `N` entries in all
+/// (see [`utils::cache::Store::directory_subtree`]).
 ///
 /// # Errors
 ///
@@ -126,7 +133,14 @@ pub async fn get_dir_info_handler(
     let path = extract_path(&uri)?;
     log_debug!("[DIR INFO] Handling request for: {path}");
 
-    let (encoded, origin, freshness) = data.store.directory_listing(&path).await?;
+    let subtree = query_u64(&uri, "subtree").unwrap_or(0).min(SUBTREE_MAX_ENTRIES);
+
+    let (encoded, origin, freshness) = if subtree == 0 {
+        data.store.directory_listing(&path).await?
+    } else {
+        let budget = usize::try_from(subtree).map_err(|_| AppError::BadRequest)?;
+        data.store.directory_subtree(&path, budget).await?
+    };
     data.cache_stats.record(origin);
 
     Ok(answer(encoded, freshness))
@@ -868,6 +882,86 @@ mod tests {
                 fb_data.files().unwrap().get(0).name().unwrap(),
                 "file_in_dir.txt"
             );
+        }
+
+        async fn subtree(budget: &str) -> bytes::Bytes {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+
+            let req = Request::builder()
+                .uri(format!("/get_dir_info?path=&subtree={budget}"))
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = build_router(state).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            resp.collect().await.unwrap().to_bytes()
+        }
+
+        /// `(parent, subdirectory, name, entries)` for each descendant, the
+        /// name looked up through the parent the way a client has to.
+        fn descendants(bytes: &[u8]) -> Vec<(u32, u32, String, usize)> {
+            let root = flatbuffers::root::<Directory>(bytes).unwrap();
+            let mut listings = vec![root];
+            let mut out = Vec::new();
+
+            for descendant in root.descendants().into_iter().flatten() {
+                let parent = listings[descendant.parent() as usize];
+                let name = parent
+                    .subdirectories()
+                    .unwrap()
+                    .get(descendant.subdirectory() as usize)
+                    .name()
+                    .unwrap()
+                    .to_owned();
+                let listing = descendant.listing().unwrap();
+                let entries = listing.subdirectories().unwrap().len() + listing.files().unwrap().len();
+
+                assert!(listing.descendants().is_none());
+                out.push((descendant.parent(), descendant.subdirectory(), name, entries));
+                listings.push(listing);
+            }
+
+            out
+        }
+
+        #[tokio::test]
+        async fn a_subtree_carries_every_listing_beneath_breadth_first() {
+            let bytes = subtree("100").await;
+
+            assert_eq!(
+                descendants(&bytes),
+                vec![
+                    (0, 0, "other_test_dir".to_owned(), 0),
+                    (0, 1, "test_dir".to_owned(), 2),
+                    (2, 0, "nested_test_dir".to_owned(), 1),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_subtree_stops_at_the_first_listing_over_budget() {
+            // The root's three entries, then one for the empty directory and
+            // three for test_dir: nested_test_dir's two do not fit.
+            let bytes = subtree("7").await;
+
+            assert_eq!(
+                descendants(&bytes),
+                vec![
+                    (0, 0, "other_test_dir".to_owned(), 0),
+                    (0, 1, "test_dir".to_owned(), 2),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_listing_without_subtree_carries_no_descendants() {
+            let bytes = subtree("0").await;
+            let root = flatbuffers::root::<Directory>(&bytes).unwrap();
+
+            assert_eq!(root.subdirectories().unwrap().len(), 2);
+            assert!(root.descendants().is_none());
         }
 
         #[tokio::test]

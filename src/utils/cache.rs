@@ -299,6 +299,28 @@ impl DirNode {
         self.own
     }
 
+    /// How many entries the listing holds.
+    #[inline]
+    pub fn entries(&self) -> usize {
+        self.metas.len()
+    }
+
+    /// Every child in name order, the order the listing holds them in.
+    pub fn children(&self) -> impl Iterator<Item = (&str, RawMeta)> {
+        self.metas
+            .iter()
+            .enumerate()
+            .filter_map(|(child, meta)| Some((self.name_of(child)?, *meta)))
+    }
+
+    /// The subdirectories in the order of the listing's `subdirectories`, so
+    /// the position of each is its index there.
+    pub fn subdirectories(&self) -> impl Iterator<Item = &str> {
+        self.children()
+            .filter(|(_, meta)| meta.is_dir)
+            .map(|(name, _)| name)
+    }
+
     /// Metadata for one child, by its exact on-disk name.
     ///
     /// Callers pass the name taken from a canonical path, which already carries
@@ -543,6 +565,82 @@ impl Store {
         let (node, scanned, listed) = self.dir_node(&canonical).await?;
 
         Ok((node.listing(), resolved.and(scanned), named.and(listed)))
+    }
+
+    /// Serialised listing for a directory, carrying the listings beneath it
+    /// breadth first for as long as their entries fit in `budget`. Each
+    /// listing costs its entries plus one, so empty directories are not free.
+    ///
+    /// A subdirectory that cannot be resolved or listed is left out rather
+    /// than failing the whole answer; asking for it alone reports why. The
+    /// walk stops at the first listing that does not fit, so what is included
+    /// is always every directory nearer the root than what is not.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, or an unreadable directory, for the directory
+    /// asked for itself.
+    pub async fn directory_subtree(
+        &self,
+        raw: &str,
+        budget: usize,
+    ) -> Result<(Bytes, Origin, Freshness), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, resolved, named) = self.resolve(&key).await?;
+        let (root, scanned, listed) = self.dir_node(&canonical).await?;
+
+        let mut origin = resolved.and(scanned);
+        let mut freshness = named.and(listed);
+        let mut remaining = budget.saturating_sub(root.entries());
+        let mut levels = vec![(key.into_owned(), root)];
+        let mut descendants = Vec::new();
+        let mut next = 0;
+
+        'walk: while let Some((dir_key, node)) = levels.get(next).cloned() {
+            let parent = u32::try_from(next).map_err(|_| AppError::Internal)?;
+
+            for (subdirectory, name) in node.subdirectories().enumerate() {
+                let child_key = if dir_key.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{dir_key}/{name}")
+                };
+
+                // A name a request could not spell (a separator inside it on
+                // unix, a ':' on Windows) has no key of its own to list it by.
+                if path::normalize(&child_key).ok().as_deref() != Some(child_key.as_str()) {
+                    continue;
+                }
+
+                let Ok((child_canonical, child_resolved, child_named)) =
+                    self.resolve(&child_key).await
+                else {
+                    continue;
+                };
+
+                let Ok((child, child_scanned, child_listed)) =
+                    self.dir_node(&child_canonical).await
+                else {
+                    continue;
+                };
+
+                let Some(left) = remaining.checked_sub(child.entries() + 1) else {
+                    break 'walk;
+                };
+
+                remaining = left;
+                origin = origin.and(child_resolved).and(child_scanned);
+                freshness = freshness.and(child_named).and(child_listed);
+
+                let subdirectory = u32::try_from(subdirectory).map_err(|_| AppError::Internal)?;
+                descendants.push((parent, subdirectory, Arc::clone(&child)));
+                levels.push((child_key, child));
+            }
+
+            next += 1;
+        }
+
+        Ok((flat::subtree(&levels[0].1, &descendants), origin, freshness))
     }
 
     /// Serialised metadata for a single entry.
