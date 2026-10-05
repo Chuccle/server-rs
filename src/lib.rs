@@ -2629,7 +2629,7 @@ mod tests {
             utils::cache::handle_fs_events(&events, &state.store).await;
 
             let batch = poll(&state, epoch, 0).await;
-            assert!(batch.modified.is_empty());
+            assert_eq!(batch.modified, Vec::<String>::new());
             assert_eq!(batch.created, vec!["moved_dir".to_owned()]);
             assert_eq!(batch.removed, vec!["test_dir".to_owned()]);
         }
@@ -2649,12 +2649,12 @@ mod tests {
 
             let batch = poll(&state, epoch, 0).await;
             assert_eq!(batch.generation, 2);
-            assert!(batch.modified.is_empty());
+            assert_eq!(batch.modified, Vec::<String>::new());
             assert_eq!(batch.created, vec!["test_dir/new_dir".to_owned()]);
 
             let since_the_create = poll(&state, epoch, 1).await;
             assert_eq!(since_the_create.modified, vec!["test_dir/new_dir".to_owned()]);
-            assert!(since_the_create.created.is_empty());
+            assert_eq!(since_the_create.created, Vec::<String>::new());
         }
 
         #[tokio::test]
