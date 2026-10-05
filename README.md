@@ -23,4 +23,10 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo run --release -- <directory to serve>    # listens on $PORT (default 8080)
 ```
 
+## Change feed
+
+`GET /get_changes?epoch=E&since=G` reports every path the filesystem watcher saw change after generation `G`, as a `ChangeBatch`, and holds the request for up to 20 s while nothing has. A client that follows it can keep metadata until it is told the path changed, instead of expiring it on a timer. Each path appears once: under `created` or `removed` if whether it exists changed, so a rename reports both of its paths, and otherwise under `modified`. A batch with `reset` set means the client must drop everything: the server restarted, or the client fell further behind than the server retains. The route answers 503 while the watcher is not running or after it reported an error, because a feed that may have missed events cannot promise that nothing changed.
+
+A metadata answer the feed cannot vouch for is marked `Cache-Control: no-store`. That covers a load that a batch of changes overtook, and any path that resolved through a symlink, since the watcher reports the target's path and not the one the client asked by. `src/utils/feed.rs` states the contract in full.
+
 Performance measurements are described in [BENCHMARKING.md](BENCHMARKING.md).
