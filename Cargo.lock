@@ -1248,6 +1248,7 @@ dependencies = [
  "env_logger",
  "flatbuffers",
  "futures",
+ "futures-util",
  "http-body-util",
  "http-range-header",
  "httpdate",

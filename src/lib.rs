@@ -956,6 +956,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_subtree_wider_than_a_batch_keeps_breadth_first_order() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+
+            for i in 0..40 {
+                std::fs::create_dir_all(temp.path().join(format!("wide/d{i:02}/s"))).unwrap();
+            }
+
+            // The root's forty entries, two for each d, then one for each of
+            // the first five s.
+            let req = Request::builder()
+                .uri("/get_dir_info?path=wide&subtree=125")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = build_router(state).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            let bytes = resp.collect().await.unwrap().to_bytes();
+            let expected: Vec<_> = (0..40)
+                .map(|i| (0, i, format!("d{i:02}"), 1))
+                .chain((0..5).map(|i| (i + 1, 0, "s".to_owned(), 0)))
+                .collect();
+
+            assert_eq!(descendants(&bytes), expected);
+        }
+
+        #[tokio::test]
         async fn a_listing_without_subtree_carries_no_descendants() {
             let bytes = subtree("0").await;
             let root = flatbuffers::root::<Directory>(&bytes).unwrap();

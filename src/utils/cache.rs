@@ -47,6 +47,7 @@ use crate::utils::feed::{Feed, Kind};
 use crate::utils::hash::RandomState;
 use crate::utils::{flat, meta::RawMeta, path};
 use bytes::Bytes;
+use futures_util::future::join_all;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -461,6 +462,11 @@ const RESOLVED_OVERHEAD: u32 = 96;
 /// Nominal weight of a "stream this one" decision, which holds no data.
 const STREAMED_WEIGHT: u32 = 64;
 
+/// Sibling directories a subtree answer looks up at once. Each lookup is a
+/// blocking-pool task or two, so this bounds how much of the pool one request
+/// can hold.
+const SUBTREE_BATCH: usize = 32;
+
 impl Store {
     /// # Errors
     ///
@@ -576,6 +582,11 @@ impl Store {
     /// walk stops at the first listing that does not fit, so what is included
     /// is always every directory nearer the root than what is not.
     ///
+    /// The directories at each depth are looked up `SUBTREE_BATCH` at a time,
+    /// so a cold subtree costs a few disk round trips per depth rather than
+    /// one per directory, and at most a batch is read past the last listing
+    /// that fits.
+    ///
     /// # Errors
     ///
     /// Traversal, missing path, or an unreadable directory, for the directory
@@ -594,53 +605,71 @@ impl Store {
         let mut remaining = budget.saturating_sub(root.entries());
         let mut levels = vec![(key.into_owned(), root)];
         let mut descendants = Vec::new();
-        let mut next = 0;
+        let mut depth = 0..levels.len();
 
-        'walk: while let Some((dir_key, node)) = levels.get(next).cloned() {
-            let parent = u32::try_from(next).map_err(|_| AppError::Internal)?;
+        // One depth at a time: every directory at it is listed already, and
+        // their children make up the next.
+        'walk: while !depth.is_empty() {
+            let mut children = Vec::new();
 
-            for (subdirectory, name) in node.subdirectories().enumerate() {
-                let child_key = if dir_key.is_empty() {
-                    name.to_owned()
-                } else {
-                    format!("{dir_key}/{name}")
-                };
+            for (parent, (dir_key, node)) in levels[depth.clone()].iter().enumerate() {
+                let parent = u32::try_from(depth.start + parent).map_err(|_| AppError::Internal)?;
 
-                // A name a request could not spell (a separator inside it on
-                // unix, a ':' on Windows) has no key of its own to list it by.
-                if path::normalize(&child_key).ok().as_deref() != Some(child_key.as_str()) {
-                    continue;
+                for (subdirectory, name) in node.subdirectories().enumerate() {
+                    let child_key = if dir_key.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{dir_key}/{name}")
+                    };
+
+                    // A name a request could not spell (a separator inside it
+                    // on unix, a ':' on Windows) has no key of its own to list
+                    // it by.
+                    if path::normalize(&child_key).ok().as_deref() == Some(child_key.as_str()) {
+                        let subdirectory =
+                            u32::try_from(subdirectory).map_err(|_| AppError::Internal)?;
+                        children.push((parent, subdirectory, child_key));
+                    }
                 }
-
-                let Ok((child_canonical, child_resolved, child_named)) =
-                    self.resolve(&child_key).await
-                else {
-                    continue;
-                };
-
-                let Ok((child, child_scanned, child_listed)) =
-                    self.dir_node(&child_canonical).await
-                else {
-                    continue;
-                };
-
-                let Some(left) = remaining.checked_sub(child.entries() + 1) else {
-                    break 'walk;
-                };
-
-                remaining = left;
-                origin = origin.and(child_resolved).and(child_scanned);
-                freshness = freshness.and(child_named).and(child_listed);
-
-                let subdirectory = u32::try_from(subdirectory).map_err(|_| AppError::Internal)?;
-                descendants.push((parent, subdirectory, Arc::clone(&child)));
-                levels.push((child_key, child));
             }
 
-            next += 1;
+            depth = levels.len()..levels.len();
+
+            for batch in children.chunks(SUBTREE_BATCH) {
+                let found =
+                    join_all(batch.iter().map(|(_, _, child_key)| self.subtree_child(child_key)))
+                        .await;
+
+                for ((parent, subdirectory, child_key), found) in batch.iter().zip(found) {
+                    let Some((child, child_origin, child_freshness)) = found else {
+                        continue;
+                    };
+
+                    let Some(left) = remaining.checked_sub(child.entries() + 1) else {
+                        break 'walk;
+                    };
+
+                    remaining = left;
+                    origin = origin.and(child_origin);
+                    freshness = freshness.and(child_freshness);
+
+                    descendants.push((*parent, *subdirectory, Arc::clone(&child)));
+                    levels.push((child_key.clone(), child));
+                    depth.end += 1;
+                }
+            }
         }
 
         Ok((flat::subtree(&levels[0].1, &descendants), origin, freshness))
+    }
+
+    /// One subdirectory's node for a subtree answer, or `None` if it cannot be
+    /// resolved or listed.
+    async fn subtree_child(&self, key: &str) -> Option<(Arc<DirNode>, Origin, Freshness)> {
+        let (canonical, resolved, named) = self.resolve(key).await.ok()?;
+        let (node, scanned, listed) = self.dir_node(&canonical).await.ok()?;
+
+        Some((node, resolved.and(scanned), named.and(listed)))
     }
 
     /// Serialised metadata for a single entry.
