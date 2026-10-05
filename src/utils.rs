@@ -6,5 +6,6 @@ pub mod http;
 pub mod logging;
 pub mod meta;
 pub mod path;
+pub mod security;
 pub mod stats;
 pub mod windows;

@@ -12,13 +12,13 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 /// A single entry's table is five scalars plus a vtable; this comfortably
-/// covers it without a realloc.
+/// covers it without a realloc. A stored descriptor grows it once.
 const ENTRY_CAPACITY: usize = 96;
 
 /// Table, vtable slot, offset and padding for one child in a listing.
 const LISTING_BYTES_PER_CHILD: usize = 64;
 
-/// Root table, both vectors and the file header.
+/// Root table, its vectors and the file header.
 const LISTING_HEADER: usize = 128;
 
 /// One `Descendant` table, its vtable and its slot in the vector.
@@ -28,8 +28,8 @@ thread_local! {
     /// One builder per worker thread, reused for the life of the process.
     ///
     /// `DirectoryEntryMetadata` is five scalars, so this buffer is allocated
-    /// once on first use and never grows again - which takes a malloc out of
-    /// every single-entry request.
+    /// once on first use and only grows for an entry that carries a stored
+    /// descriptor - which takes a malloc out of every single-entry request.
     static ENTRY_BUILDER: std::cell::RefCell<flatbuffers::FlatBufferBuilder<'static>> =
         std::cell::RefCell::new(flatbuffers::FlatBufferBuilder::with_capacity(ENTRY_CAPACITY));
 }
@@ -40,10 +40,13 @@ thread_local! {
 /// that caching the result per child would cost more memory than it saves time.
 /// The output has to be its own allocation regardless: slices of a shared blob
 /// would not be eight-byte aligned, which a `FlatBuffer` reader requires.
-pub fn entry(meta: &RawMeta) -> Bytes {
+///
+/// `security` is the entry's own descriptor, if it has one stored.
+pub fn entry(meta: &RawMeta, security: Option<&[u8]>) -> Bytes {
     ENTRY_BUILDER.with_borrow_mut(|builder| {
         builder.reset();
 
+        let security = security.map(|descriptor| builder.create_vector(descriptor));
         let table = fb::DirectoryEntryMetadata::create(
             builder,
             &fb::DirectoryEntryMetadataArgs {
@@ -52,6 +55,7 @@ pub fn entry(meta: &RawMeta) -> Bytes {
                 modified: meta.modified,
                 accessed: meta.accessed,
                 directory: meta.is_dir,
+                security,
             },
         );
 
@@ -65,13 +69,15 @@ pub fn entry(meta: &RawMeta) -> Bytes {
 ///
 /// `children` is expected to be sorted by name; the two output vectors keep
 /// that order, so clients see a stable listing no matter what order the OS
-/// walked the directory in.
-pub fn listing(children: &[(Box<str>, RawMeta)]) -> Bytes {
-    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(estimate(children));
+/// walked the directory in. `securities` are the descriptors the children's
+/// `security` indexes name.
+pub fn listing(children: &[(Box<str>, RawMeta)], securities: &[Bytes]) -> Bytes {
+    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(estimate(children, securities));
 
     let directory = directory(
         &mut builder,
         children.iter().map(|(name, meta)| (&**name, *meta)),
+        securities,
         None,
     );
 
@@ -97,7 +103,7 @@ pub fn subtree(root: &DirNode, descendants: &[(u32, u32, Arc<DirNode>)]) -> Byte
     let mut encoded = Vec::with_capacity(descendants.len());
 
     for (parent, subdirectory, node) in descendants {
-        let listing = directory(&mut builder, node.children(), None);
+        let listing = directory(&mut builder, node.children(), node.securities(), None);
 
         encoded.push(fb::Descendant::create(
             &mut builder,
@@ -110,7 +116,12 @@ pub fn subtree(root: &DirNode, descendants: &[(u32, u32, Arc<DirNode>)]) -> Byte
     }
 
     let descendants_vector = builder.create_vector(&encoded);
-    let directory = directory(&mut builder, root.children(), Some(descendants_vector));
+    let directory = directory(
+        &mut builder,
+        root.children(),
+        root.securities(),
+        Some(descendants_vector),
+    );
 
     builder.finish(directory, None);
 
@@ -124,6 +135,7 @@ type Descendants<'fbb> = flatbuffers::WIPOffset<
 fn directory<'fbb, 'name>(
     builder: &mut flatbuffers::FlatBufferBuilder<'fbb>,
     children: impl Iterator<Item = (&'name str, RawMeta)>,
+    securities: &[Bytes],
     descendants: Option<Descendants<'fbb>>,
 ) -> flatbuffers::WIPOffset<fb::Directory<'fbb>> {
     let mut subdirectories = Vec::with_capacity(children.size_hint().0);
@@ -141,6 +153,7 @@ fn directory<'fbb, 'name>(
                     created: meta.created,
                     modified: meta.modified,
                     accessed: meta.accessed,
+                    security: meta.security,
                 },
             ));
         } else {
@@ -152,6 +165,7 @@ fn directory<'fbb, 'name>(
                     created: meta.created,
                     modified: meta.modified,
                     accessed: meta.accessed,
+                    security: meta.security,
                 },
             ));
         }
@@ -160,12 +174,32 @@ fn directory<'fbb, 'name>(
     let subdirectories_vector = builder.create_vector(&subdirectories);
     let files_vector = builder.create_vector(&files);
 
+    // Left out entirely when nothing in the directory has a descriptor, so a
+    // tree without any encodes exactly as it did before they existed.
+    let security = (!securities.is_empty()).then(|| {
+        let tables = securities
+            .iter()
+            .map(|descriptor| {
+                let descriptor = builder.create_vector(descriptor);
+                fb::Security::create(
+                    builder,
+                    &fb::SecurityArgs {
+                        descriptor: Some(descriptor),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        builder.create_vector(&tables)
+    });
+
     fb::Directory::create(
         builder,
         &fb::DirectoryArgs {
             subdirectories: Some(subdirectories_vector),
             files: Some(files_vector),
             descendants,
+            security,
         },
     )
 }
@@ -174,10 +208,15 @@ fn directory<'fbb, 'name>(
 ///
 /// The previous estimate reserved 324 bytes per child regardless of name
 /// length, which meant a 10k-entry directory asked for a 3 MB buffer.
-fn estimate(children: &[(Box<str>, RawMeta)]) -> usize {
+fn estimate(children: &[(Box<str>, RawMeta)], securities: &[Bytes]) -> usize {
     children
         .iter()
         .map(|(name, _)| name.len() + LISTING_BYTES_PER_CHILD)
+        .chain(
+            securities
+                .iter()
+                .map(|descriptor| descriptor.len() + LISTING_BYTES_PER_CHILD),
+        )
         .sum::<usize>()
         + LISTING_HEADER
 }

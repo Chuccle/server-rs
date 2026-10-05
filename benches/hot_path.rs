@@ -116,10 +116,11 @@ fn bench_encode_entry(c: &mut Criterion) {
         modified: 133_000_000_000_000_001,
         accessed: 133_000_000_000_000_002,
         is_dir: false,
+        security: 0,
     };
 
     c.bench_function("flat/entry", |b| {
-        b.iter(|| flat::entry(black_box(&meta)));
+        b.iter(|| flat::entry(black_box(&meta), None));
     });
 }
 

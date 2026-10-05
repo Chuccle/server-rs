@@ -1252,6 +1252,7 @@ dependencies = [
  "http-body-util",
  "http-range-header",
  "httpdate",
+ "libc",
  "log",
  "mime_guess",
  "moka",

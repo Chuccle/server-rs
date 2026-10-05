@@ -45,10 +45,10 @@ use crate::error::AppError;
 // See `crate::utils::hash` for why these caches do not use the default hasher.
 use crate::utils::feed::{Feed, Kind};
 use crate::utils::hash::RandomState;
-use crate::utils::{flat, meta::RawMeta, path};
+use crate::utils::{flat, meta::RawMeta, path, security};
 use bytes::Bytes;
 use futures_util::future::join_all;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +139,12 @@ fn widen(value: u32) -> usize {
 pub struct DirNode {
     listing: Bytes,
     own: RawMeta,
+    /// This directory's own stored descriptor, which only the served root is
+    /// ever answered out of: every other entry is answered by its parent.
+    own_security: Option<Bytes>,
+    /// The distinct descriptors the children have stored, which their
+    /// `security` indexes name. Empty unless the directory is marked.
+    securities: Box<[Bytes]>,
 
     /// Child names concatenated in name order.
     names: Box<str>,
@@ -214,6 +220,28 @@ fn stat_children(entries: &[std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
     })
 }
 
+/// Reads the descriptor each child of a marked directory has stored, and
+/// numbers the distinct ones in the order first met, which is name order.
+/// Children sharing a descriptor - the usual case when one was set on many at
+/// once - share an index, so the listing carries it once.
+fn children_securities(path: &Path, children: &mut [(Box<str>, RawMeta)]) -> Vec<Bytes> {
+    let mut securities: Vec<Bytes> = Vec::new();
+    let mut numbered: HashMap<Bytes, u32> = HashMap::new();
+
+    for (name, meta) in children {
+        let Some(descriptor) = security::read(&path.join(&**name)) else {
+            continue;
+        };
+
+        meta.security = *numbered.entry(descriptor).or_insert_with_key(|descriptor| {
+            securities.push(descriptor.clone());
+            u32::try_from(securities.len()).unwrap_or(u32::MAX)
+        });
+    }
+
+    securities
+}
+
 impl DirNode {
     /// Read a directory and encode everything the hot path will ever need.
     ///
@@ -239,7 +267,13 @@ impl DirNode {
 
         children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
-        let listing = flat::listing(&children);
+        let securities = if security::marked(path) {
+            children_securities(path, &mut children)
+        } else {
+            Vec::new()
+        };
+
+        let listing = flat::listing(&children, &securities);
 
         let mut names = String::with_capacity(children.iter().map(|(name, _)| name.len()).sum());
         let mut offsets = Vec::with_capacity(children.len() + 1);
@@ -269,7 +303,11 @@ impl DirNode {
             slots.push(position);
         }
 
+        let own_security = security::read(path);
+
         let footprint = listing.len()
+            + own_security.as_ref().map_or(0, Bytes::len)
+            + securities.iter().map(Bytes::len).sum::<usize>()
             + names.len()
             + offsets.len() * size_of::<u32>()
             + metas.len() * size_of::<RawMeta>()
@@ -279,6 +317,8 @@ impl DirNode {
         Ok(Self {
             listing,
             own: RawMeta::from_std(&own_metadata),
+            own_security,
+            securities: securities.into_boxed_slice(),
             names: names.into_boxed_str(),
             offsets: offsets.into_boxed_slice(),
             metas: metas.into_boxed_slice(),
@@ -298,6 +338,29 @@ impl DirNode {
     #[inline]
     pub const fn own(&self) -> RawMeta {
         self.own
+    }
+
+    /// This directory's own stored descriptor.
+    #[inline]
+    pub fn own_security(&self) -> Option<&[u8]> {
+        self.own_security.as_deref()
+    }
+
+    /// The descriptors the listing holds, in the order its children's
+    /// `security` indexes name them.
+    #[inline]
+    pub fn securities(&self) -> &[Bytes] {
+        &self.securities
+    }
+
+    /// The descriptor a child's `security` index names, if it has one.
+    #[inline]
+    pub fn security(&self, meta: &RawMeta) -> Option<&[u8]> {
+        let index = meta.security.checked_sub(1)?;
+
+        self.securities
+            .get(widen(index))
+            .map(|descriptor| &**descriptor)
     }
 
     /// How many entries the listing holds.
@@ -453,6 +516,10 @@ pub struct Store {
     dirs: PathCache<Arc<DirNode>>,
     contents: PathCache<Content>,
     feed: Feed,
+    /// Held from a generation's start to its publication. A feed client that
+    /// has seen a generation is never shown an older one, so two writers must
+    /// not publish out of the order they began in.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 /// Rough fixed cost of one resolution entry: two allocations plus the cache's
@@ -514,6 +581,7 @@ impl Store {
             dirs,
             contents,
             feed: Feed::new(config.feed_retained, config.feed_hold),
+            publishing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -636,9 +704,12 @@ impl Store {
             depth = levels.len()..levels.len();
 
             for batch in children.chunks(SUBTREE_BATCH) {
-                let found =
-                    join_all(batch.iter().map(|(_, _, child_key)| self.subtree_child(child_key)))
-                        .await;
+                let found = join_all(
+                    batch
+                        .iter()
+                        .map(|(_, _, child_key)| self.subtree_child(child_key)),
+                )
+                .await;
 
                 for ((parent, subdirectory, child_key), found) in batch.iter().zip(found) {
                     let Some((child, child_origin, child_freshness)) = found else {
@@ -688,7 +759,7 @@ impl Store {
         if *canonical == *self.base {
             let (node, scanned, listed) = self.dir_node(&canonical).await?;
             return Ok((
-                flat::entry(&node.own()),
+                flat::entry(&node.own(), node.own_security()),
                 resolved.and(scanned),
                 named.and(listed),
             ));
@@ -699,7 +770,11 @@ impl Store {
             && let Ok((node, scanned, listed)) = self.dir_node(parent).await
             && let Some(meta) = node.child(name)
         {
-            return Ok((flat::entry(&meta), resolved.and(scanned), named.and(listed)));
+            return Ok((
+                flat::entry(&meta, node.security(&meta)),
+                resolved.and(scanned),
+                named.and(listed),
+            ));
         }
 
         // Either the parent could not be listed, or the entry appeared after it
@@ -708,10 +783,13 @@ impl Store {
         // parent. A stat is read after the request arrived, so it is as current
         // as the feed can promise anything to be.
         let target = canonical.to_path_buf();
-        let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(target)).await??;
+        let (metadata, descriptor) = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&target).map(|metadata| (metadata, security::read(&target)))
+        })
+        .await??;
 
         Ok((
-            flat::entry(&RawMeta::from_std(&metadata)),
+            flat::entry(&RawMeta::from_std(&metadata), descriptor.as_deref()),
             Origin::Filesystem,
             named,
         ))
@@ -845,6 +923,47 @@ impl Store {
         Ok((Arc::clone(&entry.value), origin, Freshness::of(vouched)))
     }
 
+    /// Store or remove the descriptor of the entry `raw` names, and publish
+    /// the change at once rather than when the watcher reports it, so that no
+    /// answer loaded before the write is vouched for after it.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, permission denied, or a filesystem that cannot
+    /// hold extended attributes or streams.
+    pub async fn set_security(&self, raw: &str, descriptor: Option<Bytes>) -> Result<(), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, _, _) = self.resolve(&key).await?;
+        let listed_in = (*canonical != *self.base)
+            .then(|| canonical.parent().map(Path::to_path_buf))
+            .flatten();
+
+        // Written before the generation begins, as the watcher would see it:
+        // a load that starts after this sees the new descriptor, and one that
+        // started before is overtaken.
+        let target = Arc::clone(&canonical);
+        let written = tokio::task::spawn_blocking(move || {
+            security::write(&target, descriptor.as_deref(), listed_in.as_deref())
+        })
+        .await
+        .map_err(AppError::from)
+        .and_then(|written| written.map_err(AppError::from));
+
+        let _publishing = self.publishing.lock().await;
+        let generation = self.feed.begin();
+
+        self.invalidate_content(&canonical).await;
+
+        match path::key_of(&self.base, &canonical) {
+            Some(key) => self
+                .feed
+                .publish(generation, vec![(key.into_boxed_str(), Kind::Modified)]),
+            None => self.feed.publish_reset(generation),
+        }
+
+        written
+    }
+
     /// Drop everything. Used when the watcher reports it lost track of events.
     pub fn invalidate_all(&self) {
         self.resolved.invalidate_all();
@@ -854,9 +973,12 @@ impl Store {
 
     /// A file's bytes changed but its position in the tree did not: drop its
     /// contents and the parent listing that quotes its size and timestamps.
-    /// Resolutions stay valid, so this is O(1) and leaves the hot path warm.
+    /// A directory's own node goes too, since the served root answers for
+    /// itself out of it. Resolutions stay valid, so this is O(1) and leaves
+    /// the hot path warm.
     pub async fn invalidate_content(&self, path: &Path) {
         self.contents.invalidate(path).await;
+        self.dirs.invalidate(path).await;
 
         if let Some(parent) = path.parent() {
             self.dirs.invalidate(parent).await;
@@ -1048,6 +1170,7 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
 
         if event.need_rescan() {
             crate::log_warn!("File watch rescan flag received, dropping all cached state");
+            let _publishing = store.publishing.lock().await;
             let generation = store.feed.begin();
             store.invalidate_all();
             store.feed.publish_reset(generation);
@@ -1075,6 +1198,7 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
         return;
     }
 
+    let _publishing = store.publishing.lock().await;
     let generation = store.feed.begin();
 
     for path in &content_changes {

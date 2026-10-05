@@ -82,6 +82,10 @@ fn mark(response: &mut axum::response::Response, freshness: utils::cache::Freshn
 pub struct AppState {
     pub store: utils::cache::Store,
     pub cache_stats: utils::stats::Cache,
+    /// Whether requests that change the tree are served. Off unless the
+    /// `WRITABLE` environment variable is `1`: the server does not know who
+    /// is asking, so letting anyone who can reach it write is opted into.
+    pub writable: bool,
 }
 
 impl AppState {
@@ -92,6 +96,7 @@ impl AppState {
         Ok(Self {
             store: utils::cache::Store::new(base_path, config)?,
             cache_stats: utils::stats::Cache::new(),
+            writable: false,
         })
     }
 }
@@ -216,6 +221,39 @@ pub async fn get_file_handler(
     Ok(response)
 }
 
+/// `PUT /set_security` - store the request body as the entry's security
+/// descriptor, or with an empty body remove it so the entry inherits.
+///
+/// # Errors
+///
+/// [`AppError::PermissionDenied`] on a server that is not writable,
+/// [`AppError::BadRequest`] for a body that is not a self-relative
+/// descriptor, and the usual path and I/O mappings.
+pub async fn set_security_handler(
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    uri: axum::http::Uri,
+    body: bytes::Bytes,
+) -> Result<axum::http::StatusCode, AppError> {
+    if !data.writable {
+        return Err(AppError::PermissionDenied);
+    }
+
+    let path = extract_path(&uri)?;
+    log_debug!("[SET SECURITY] Handling request for: {path}");
+
+    let descriptor = if body.is_empty() {
+        None
+    } else if utils::security::valid(&body) {
+        Some(body)
+    } else {
+        return Err(AppError::BadRequest);
+    };
+
+    data.store.set_security(&path, descriptor).await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 /// Every route the server serves, in one place, so that tests and benchmarks
 /// exercise the same wiring as production.
 pub fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
@@ -228,6 +266,7 @@ pub fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
         .route("/get_changes", axum::routing::get(get_changes_handler))
         .route("/get_file", axum::routing::get(get_file_handler))
         .route("/get_file", axum::routing::head(get_file_handler))
+        .route("/set_security", axum::routing::put(set_security_handler))
         .route(
             "/healthcheck",
             axum::routing::get(|| async { axum::http::StatusCode::OK }),
@@ -264,7 +303,10 @@ pub async fn run() -> std::io::Result<()> {
         .parse()
         .unwrap_or(8080);
 
-    let state = std::sync::Arc::new(AppState::new(&path, utils::cache::Config::default())?);
+    let state = std::sync::Arc::new(AppState {
+        writable: std::env::var("WRITABLE").is_ok_and(|value| value == "1"),
+        ..AppState::new(&path, utils::cache::Config::default())?
+    });
 
     #[cfg(feature = "stats")]
     start_cache_statistics_logger(state.clone());
@@ -2399,6 +2441,203 @@ mod tests {
                 .unwrap();
             let resp = app.call(req).await.unwrap();
             assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// Descriptors are stored on the test's own files, so these need a
+    /// filesystem with user extended attributes, as every common Linux one
+    /// has.
+    mod descriptors {
+        use super::*;
+
+        /// `O:BAD:` with an empty DACL, self-relative: the smallest real
+        /// descriptor.
+        const LOCKED: [u8; 28] = [
+            1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 2, 0, 8, 0, 0, 0, 0,
+            0,
+        ];
+
+        fn writable(base: &std::path::Path) -> Arc<AppState> {
+            let state = Arc::into_inner(setup_test_env(base)).unwrap();
+
+            Arc::new(AppState {
+                writable: true,
+                ..state
+            })
+        }
+
+        async fn put(state: &Arc<AppState>, path: &str, body: &[u8]) -> http::StatusCode {
+            let req = Request::builder()
+                .uri(format!("/set_security?path={path}"))
+                .method("PUT")
+                .body(Body::from(body.to_vec()))
+                .unwrap();
+
+            build_router(Arc::clone(state))
+                .oneshot(req)
+                .await
+                .unwrap()
+                .status()
+        }
+
+        async fn get(state: &Arc<AppState>, uri: &str) -> bytes::Bytes {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = build_router(Arc::clone(state)).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            resp.collect().await.unwrap().to_bytes()
+        }
+
+        #[tokio::test]
+        async fn a_read_only_server_refuses_to_store_one() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+
+            assert_eq!(
+                put(&state, "test_file.txt", &LOCKED).await,
+                http::StatusCode::FORBIDDEN
+            );
+            assert!(utils::security::read(&temp.path().join("test_file.txt")).is_none());
+        }
+
+        #[tokio::test]
+        async fn what_is_not_a_descriptor_is_a_bad_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            let mut absolute = LOCKED;
+            absolute[3] = 0;
+
+            assert_eq!(
+                put(&state, "test_file.txt", &absolute).await,
+                http::StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                put(&state, "test_file.txt", &LOCKED[..19]).await,
+                http::StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tree_without_any_lists_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            let listing = get(&state, "/get_dir_info?path=test_dir").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            assert!(listing.security().is_none());
+            assert!(
+                listing
+                    .files()
+                    .unwrap()
+                    .iter()
+                    .all(|file| file.security() == 0)
+            );
+
+            let entry = get(&state, "/get_dir_entry_info?path=test_file.txt").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert!(entry.security().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_shared_descriptor_is_listed_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+            fs::write(temp.path().join("test_dir/second.txt"), b"second").unwrap();
+
+            // Listed first, so the store has something to invalidate.
+            get(&state, "/get_dir_info?path=test_dir").await;
+
+            for path in [
+                "test_dir/file_in_dir.txt",
+                "test_dir/second.txt",
+                "test_dir/nested_test_dir",
+            ] {
+                assert_eq!(
+                    put(&state, path, &LOCKED).await,
+                    http::StatusCode::NO_CONTENT
+                );
+            }
+
+            let listing = get(&state, "/get_dir_info?path=test_dir").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            let securities = listing.security().unwrap();
+
+            assert_eq!(securities.len(), 1);
+            assert_eq!(securities.get(0).descriptor().unwrap().bytes(), LOCKED);
+            assert!(
+                listing
+                    .files()
+                    .unwrap()
+                    .iter()
+                    .all(|file| file.security() == 1)
+            );
+            assert_eq!(listing.subdirectories().unwrap().get(0).security(), 1);
+
+            let entry = get(&state, "/get_dir_entry_info?path=test_dir/second.txt").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert_eq!(entry.security().unwrap().bytes(), LOCKED);
+        }
+
+        #[tokio::test]
+        async fn an_empty_body_inherits_again() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            assert_eq!(
+                put(&state, "test_file.txt", &LOCKED).await,
+                http::StatusCode::NO_CONTENT
+            );
+            get(&state, "/get_dir_entry_info?path=test_file.txt").await;
+            assert_eq!(
+                put(&state, "test_file.txt", &[]).await,
+                http::StatusCode::NO_CONTENT
+            );
+
+            let entry = get(&state, "/get_dir_entry_info?path=test_file.txt").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert!(entry.security().is_none());
+
+            let listing = get(&state, "/get_dir_info?path=").await;
+            let listing = flatbuffers::root::<Directory>(&listing).unwrap();
+            assert!(listing.security().is_none());
+        }
+
+        #[tokio::test]
+        async fn the_root_answers_for_its_own() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+
+            get(&state, "/get_dir_entry_info?path=").await;
+            assert_eq!(put(&state, "", &LOCKED).await, http::StatusCode::NO_CONTENT);
+
+            let entry = get(&state, "/get_dir_entry_info?path=").await;
+            let entry = flatbuffers::root::<DirectoryEntryMetadata>(&entry).unwrap();
+            assert_eq!(entry.security().unwrap().bytes(), LOCKED);
+
+            // Nothing outside the served root is marked on its behalf.
+            assert!(!utils::security::marked(temp.path().parent().unwrap()));
+        }
+
+        #[tokio::test]
+        async fn storing_one_is_published_to_the_feed() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = writable(temp.path());
+            state.store.feed().go_live();
+            let before = state.store.feed().current();
+
+            assert_eq!(
+                put(&state, "test_file.txt", &LOCKED).await,
+                http::StatusCode::NO_CONTENT
+            );
+
+            let batch = state
+                .store
+                .feed()
+                .poll(state.store.feed().epoch(), before)
+                .await
+                .unwrap();
+            assert_eq!(&*batch.modified, [Box::from("test_file.txt")]);
         }
     }
 

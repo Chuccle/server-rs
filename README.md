@@ -33,4 +33,10 @@ A metadata answer the feed cannot vouch for is marked `Cache-Control: no-store`.
 
 `GET /get_dir_info?path=P&subtree=N` answers with `P`'s listing plus, in its `descendants`, the listings of the directories beneath it, breadth first, until the next one would take the answer past `N` entries; each listing counts its entries plus one, and `N` is capped at 65536. A descendant names its directory by position: the `subdirectory`-th entry of listing `parent`, where 0 is `P` itself. Without `subtree` the answer is the plain listing, as before.
 
+## Security descriptors
+
+An entry may carry a Windows security descriptor, which the server stores without interpreting: a client's kernel does the access check. It is kept on the file itself, in the `user.blorgfs.sd` extended attribute on Unix or the `blorgfs.sd` stream on Windows, so it follows a rename and goes with a delete. An entry without one inherits from the directory it is in. A listing carries each distinct descriptor once, in its `security` vector, and an entry names its own by position plus one, 0 meaning it inherits; a tree in which nothing has one is answered exactly as before.
+
+`PUT /set_security?path=P` stores the request body as `P`'s descriptor, or with an empty body removes it, and answers 204. It is refused with 403 unless the server was started with `WRITABLE=1`: the server does not know who is asking, so anyone who can reach a writable server can change what it serves.
+
 Performance measurements are described in [BENCHMARKING.md](BENCHMARKING.md).

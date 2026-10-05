@@ -1,10 +1,12 @@
 //! The flat metadata record every cache layer stores.
 
-/// One filesystem entry, reduced to the five scalars the wire schema carries.
+/// One filesystem entry, reduced to the scalars the wire schema carries.
 ///
 /// `Copy` and free of pointers on purpose: directory children are held in a
 /// single `Box<[RawMeta]>`, so a listing walk is a linear scan over 40-byte
-/// rows instead of a pointer chase through per-entry allocations.
+/// rows instead of a pointer chase through per-entry allocations. A security
+/// descriptor is held once by the listing, so a row names it by index; the
+/// index fits in what was padding.
 ///
 /// Timestamps are Windows `FILETIME` ticks (100 ns since 1601) because that is
 /// what the schema declares; see [`crate::utils::windows::time`].
@@ -15,6 +17,9 @@ pub struct RawMeta {
     pub modified: u64,
     pub accessed: u64,
     pub is_dir: bool,
+    /// `k` is the listing's descriptor `k - 1`; 0 inherits, as the schema's
+    /// `security` does.
+    pub security: u32,
 }
 
 impl RawMeta {
@@ -26,6 +31,7 @@ impl RawMeta {
             modified: file_time(metadata.modified()),
             accessed: file_time(metadata.accessed()),
             is_dir: metadata.is_dir(),
+            security: 0,
         }
     }
 }
