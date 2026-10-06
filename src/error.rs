@@ -16,6 +16,8 @@ pub enum AppError {
     Internal,
     #[error("Missing or malformed request")]
     BadRequest,
+    #[error("Change feed is not running")]
+    FeedUnavailable,
 }
 
 impl From<std::io::Error> for AppError {
@@ -51,6 +53,7 @@ impl axum::response::IntoResponse for AppError {
             Self::NotFound => axum::http::StatusCode::NOT_FOUND,
             Self::Internal => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest => axum::http::StatusCode::BAD_REQUEST,
+            Self::FeedUnavailable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         };
 
         axum::response::IntoResponse::into_response(status)

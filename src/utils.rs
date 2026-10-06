@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod feed;
 pub mod flat;
 pub mod hash;
 pub mod http;

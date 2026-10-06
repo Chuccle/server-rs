@@ -28,15 +28,29 @@
 //! re-validated from scratch every time. The filesystem watcher drops
 //! resolutions whose canonical path sits at or under anything created, removed
 //! or renamed, and every entry is additionally bounded by TTL.
+//!
+//! # Coherence with the change feed
+//!
+//! Clients that follow [`crate::utils::feed`] keep answers until it says they
+//! changed, so a stale answer handed out after the feed has published the
+//! change that made it stale is kept for good. Every entry is therefore
+//! [`Stamped`] with the generation its load began at, and an answer is vouched
+//! for only when no generation began between that stamp and the entry's
+//! insertion. One that was overtaken is dropped from the cache and served with
+//! `Cache-Control: no-store`, as is any answer for a path that reached its
+//! target through a symlink: the watcher reports the target's path, which is
+//! not the one the client asked by.
 
 use crate::error::AppError;
 // See `crate::utils::hash` for why these caches do not use the default hasher.
+use crate::utils::feed::{Feed, Kind};
 use crate::utils::hash::RandomState;
 use crate::utils::{flat, meta::RawMeta, path};
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether a response was assembled without touching the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +90,13 @@ pub struct Config {
     pub content_bytes: u64,
     /// Files above this size are streamed from disk instead of held resident.
     pub max_resident_file_bytes: u64,
+    /// How long a change-feed poll with nothing new to report is held before
+    /// it is answered with an empty batch. Below the driver's 30 s receive
+    /// timeout, with room for the round trip.
+    pub feed_hold: std::time::Duration,
+    /// How many changed paths the feed keeps for clients that are behind. A
+    /// client further behind than this is told to reset.
+    pub feed_retained: usize,
 }
 
 impl Default for Config {
@@ -86,6 +107,8 @@ impl Default for Config {
             metadata_bytes: 256 * 1024 * 1024,
             content_bytes: 512 * 1024 * 1024,
             max_resident_file_bytes: 8 * 1024 * 1024,
+            feed_hold: std::time::Duration::from_secs(20),
+            feed_retained: 16384,
         }
     }
 }
@@ -321,6 +344,72 @@ pub struct FileNode {
     pub etag: Option<axum::http::HeaderValue>,
 }
 
+/// A cached value and the feed generation its load began at.
+///
+/// An invalidation cannot reach a load still in flight: `moka` inserts what
+/// the load returns after the sweep that should have removed it, and the stale
+/// entry then lives out its TTL. Without the feed that cost a TTL of
+/// staleness; with it, a client that has already applied the change would keep
+/// the stale answer indefinitely. So an entry is vouched for only once
+/// something has seen that no generation began after its stamp - see
+/// [`Store::vouch`] - and an entry that cannot be is dropped rather than
+/// served as current.
+pub struct Stamped<T> {
+    pub value: T,
+    generation: u64,
+    vouched: AtomicBool,
+}
+
+impl<T> Stamped<T> {
+    fn new(value: T, generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            value,
+            generation,
+            vouched: AtomicBool::new(false),
+        })
+    }
+}
+
+/// A request key resolved to a canonical path.
+pub struct Resolution {
+    pub canonical: Arc<Path>,
+    /// The canonical path is not the key spelled under the root, so it was
+    /// reached through a symlink (or, on Windows, a different case). The
+    /// watcher reports changes by canonical path, which a client keyed by
+    /// this request's path would never match.
+    pub aliased: bool,
+}
+
+/// What a client may do with an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Keep it until the change feed says otherwise.
+    Vouched,
+    /// Use it once; the feed cannot vouch for it.
+    Unvouched,
+}
+
+impl Freshness {
+    #[must_use]
+    #[inline]
+    pub fn and(self, other: Self) -> Self {
+        if self == Self::Vouched && other == Self::Vouched {
+            Self::Vouched
+        } else {
+            Self::Unvouched
+        }
+    }
+
+    #[inline]
+    const fn of(vouched: bool) -> Self {
+        if vouched {
+            Self::Vouched
+        } else {
+            Self::Unvouched
+        }
+    }
+}
+
 /// What the file endpoint should do with a resolved path.
 #[derive(Clone)]
 pub enum Content {
@@ -331,15 +420,16 @@ pub enum Content {
     Streamed,
 }
 
-type PathCache<V> = moka::future::Cache<PathBuf, V, RandomState>;
-type KeyCache<V> = moka::future::Cache<String, V, RandomState>;
+type PathCache<V> = moka::future::Cache<PathBuf, Arc<Stamped<V>>, RandomState>;
+type KeyCache<V> = moka::future::Cache<String, Arc<Stamped<V>>, RandomState>;
 
 pub struct Store {
     base: PathBuf,
     config: Config,
-    resolved: KeyCache<Arc<Path>>,
+    resolved: KeyCache<Resolution>,
     dirs: PathCache<Arc<DirNode>>,
     contents: PathCache<Content>,
+    feed: Feed,
 }
 
 /// Rough fixed cost of one resolution entry: two allocations plus the cache's
@@ -360,8 +450,8 @@ impl Store {
 
         let resolved = moka::future::Cache::builder()
             .max_capacity(config.metadata_bytes)
-            .weigher(|key: &String, value: &Arc<Path>| {
-                let bytes = key.len() + value.as_os_str().len();
+            .weigher(|key: &String, value: &Arc<Stamped<Resolution>>| {
+                let bytes = key.len() + value.value.canonical.as_os_str().len();
                 u32::try_from(bytes)
                     .unwrap_or(u32::MAX)
                     .saturating_add(RESOLVED_OVERHEAD)
@@ -372,17 +462,19 @@ impl Store {
 
         let dirs = moka::future::Cache::builder()
             .max_capacity(config.metadata_bytes)
-            .weigher(|_: &PathBuf, value: &Arc<DirNode>| value.weight)
+            .weigher(|_: &PathBuf, value: &Arc<Stamped<Arc<DirNode>>>| value.value.weight)
             .time_to_live(config.time_to_live)
             .time_to_idle(config.time_to_idle)
             .build_with_hasher(RandomState::default());
 
         let contents = moka::future::Cache::builder()
             .max_capacity(config.content_bytes)
-            .weigher(|_: &PathBuf, value: &Content| match value {
-                Content::Resident(node) => u32::try_from(node.data.len()).unwrap_or(u32::MAX),
-                Content::Streamed => STREAMED_WEIGHT,
-            })
+            .weigher(
+                |_: &PathBuf, value: &Arc<Stamped<Content>>| match &value.value {
+                    Content::Resident(node) => u32::try_from(node.data.len()).unwrap_or(u32::MAX),
+                    Content::Streamed => STREAMED_WEIGHT,
+                },
+            )
             .time_to_live(config.time_to_live)
             .time_to_idle(config.time_to_idle)
             .build_with_hasher(RandomState::default());
@@ -393,6 +485,7 @@ impl Store {
             resolved,
             dirs,
             contents,
+            feed: Feed::new(config.feed_retained, config.feed_hold),
         })
     }
 
@@ -401,17 +494,55 @@ impl Store {
         &self.base
     }
 
+    #[inline]
+    pub const fn feed(&self) -> &Feed {
+        &self.feed
+    }
+
+    /// Whether `entry` may be handed out as current.
+    ///
+    /// Called after the entry is in the cache. If no generation began since its
+    /// load did, any that begins later invalidates after it begins - so after
+    /// this check, and after the insert before it - and will remove the entry
+    /// if it changed. Once vouched, an entry stays vouched: the argument does
+    /// not depend on who asks.
+    fn vouch<T>(&self, entry: &Stamped<T>) -> bool {
+        if entry.vouched.load(Ordering::Acquire) {
+            return true;
+        }
+
+        if self.feed.unchanged_since(entry.generation) {
+            entry.vouched.store(true, Ordering::Release);
+            return true;
+        }
+
+        false
+    }
+
+    /// The paths a client knows these by, spelled as a request would spell them.
+    ///
+    /// `None` if any cannot be (outside the root, or not UTF-8), in which case
+    /// the batch can only be published as a reset.
+    fn feed_keys<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Option<Vec<Box<str>>> {
+        paths
+            .map(|path| path::key_of(&self.base, path).map(String::into_boxed_str))
+            .collect()
+    }
+
     /// Serialised listing for a directory.
     ///
     /// # Errors
     ///
     /// Traversal, missing path, or an unreadable directory.
-    pub async fn directory_listing(&self, raw: &str) -> Result<(Bytes, Origin), AppError> {
+    pub async fn directory_listing(
+        &self,
+        raw: &str,
+    ) -> Result<(Bytes, Origin, Freshness), AppError> {
         let key = path::normalize(raw)?;
-        let (canonical, resolved) = self.resolve(&key).await?;
-        let (node, scanned) = self.dir_node(&canonical).await?;
+        let (canonical, resolved, named) = self.resolve(&key).await?;
+        let (node, scanned, listed) = self.dir_node(&canonical).await?;
 
-        Ok((node.listing(), resolved.and(scanned)))
+        Ok((node.listing(), resolved.and(scanned), named.and(listed)))
     }
 
     /// Serialised metadata for a single entry.
@@ -421,35 +552,41 @@ impl Store {
     /// # Errors
     ///
     /// Traversal, missing path, or permission denied.
-    pub async fn entry_metadata(&self, raw: &str) -> Result<(Bytes, Origin), AppError> {
+    pub async fn entry_metadata(&self, raw: &str) -> Result<(Bytes, Origin, Freshness), AppError> {
         let key = path::normalize(raw)?;
-        let (canonical, resolved) = self.resolve(&key).await?;
+        let (canonical, resolved, named) = self.resolve(&key).await?;
 
         // The served root has no parent inside the tree, so it answers for
         // itself out of its own node.
         if *canonical == *self.base {
-            let (node, scanned) = self.dir_node(&canonical).await?;
-            return Ok((flat::entry(&node.own()), resolved.and(scanned)));
+            let (node, scanned, listed) = self.dir_node(&canonical).await?;
+            return Ok((
+                flat::entry(&node.own()),
+                resolved.and(scanned),
+                named.and(listed),
+            ));
         }
 
         if let Some(parent) = canonical.parent()
             && let Some(name) = canonical.file_name().and_then(std::ffi::OsStr::to_str)
-            && let Ok((node, scanned)) = self.dir_node(parent).await
+            && let Ok((node, scanned, listed)) = self.dir_node(parent).await
             && let Some(meta) = node.child(name)
         {
-            return Ok((flat::entry(&meta), resolved.and(scanned)));
+            return Ok((flat::entry(&meta), resolved.and(scanned), named.and(listed)));
         }
 
         // Either the parent could not be listed, or the entry appeared after it
         // was scanned and the watcher has not caught up yet. Stat directly
         // rather than hide a readable entry behind an unreadable or stale
-        // parent.
+        // parent. A stat is read after the request arrived, so it is as current
+        // as the feed can promise anything to be.
         let target = canonical.to_path_buf();
         let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(target)).await??;
 
         Ok((
             flat::entry(&RawMeta::from_std(&metadata)),
             Origin::Filesystem,
+            named,
         ))
     }
 
@@ -458,28 +595,48 @@ impl Store {
     /// # Errors
     ///
     /// Traversal, missing path, or permission denied.
-    pub async fn file_content(&self, raw: &str) -> Result<(Arc<Path>, Content, Origin), AppError> {
+    pub async fn file_content(
+        &self,
+        raw: &str,
+    ) -> Result<(Arc<Path>, Content, Origin, Freshness), AppError> {
         let key = path::normalize(raw)?;
-        let (canonical, resolved) = self.resolve(&key).await?;
+        let (canonical, resolved, named) = self.resolve(&key).await?;
 
-        if let Some(content) = self.contents.get(&*canonical).await {
-            return Ok((canonical, content, resolved));
+        let (entry, origin) = if let Some(entry) = self.contents.get(&*canonical).await {
+            (entry, resolved)
+        } else {
+            let cache_key = canonical.to_path_buf();
+            let load_path = cache_key.clone();
+            let limit = self.config.max_resident_file_bytes;
+            let generation = self.feed.current();
+
+            let entry = self
+                .contents
+                .try_get_with(cache_key, async move {
+                    let content =
+                        tokio::task::spawn_blocking(move || load_content(&load_path, limit))
+                            .await
+                            .map_err(AppError::from)??;
+
+                    Ok::<_, AppError>(Stamped::new(content, generation))
+                })
+                .await?;
+
+            (entry, Origin::Filesystem)
+        };
+
+        let vouched = self.vouch(&entry);
+
+        if !vouched {
+            self.contents.invalidate(&*canonical).await;
         }
 
-        let cache_key = canonical.to_path_buf();
-        let load_path = cache_key.clone();
-        let limit = self.config.max_resident_file_bytes;
-
-        let content = self
-            .contents
-            .try_get_with(cache_key, async move {
-                tokio::task::spawn_blocking(move || load_content(&load_path, limit))
-                    .await
-                    .map_err(AppError::from)?
-            })
-            .await?;
-
-        Ok((canonical, content, Origin::Filesystem))
+        Ok((
+            canonical,
+            entry.value.clone(),
+            origin,
+            named.and(Freshness::of(vouched)),
+        ))
     }
 
     /// Request key to canonical path, coalescing concurrent cold lookups so a
@@ -487,48 +644,89 @@ impl Store {
     ///
     /// Only successes are cached, which keeps an "allowed" verdict from
     /// outliving the symlink topology that justified it.
-    async fn resolve(&self, key: &str) -> Result<(Arc<Path>, Origin), AppError> {
-        if let Some(canonical) = self.resolved.get(key).await {
-            return Ok((canonical, Origin::Cache));
+    async fn resolve(&self, key: &str) -> Result<(Arc<Path>, Origin, Freshness), AppError> {
+        let (entry, origin) = if let Some(entry) = self.resolved.get(key).await {
+            (entry, Origin::Cache)
+        } else {
+            let base = self.base.clone();
+            let owned = key.to_owned();
+            let resolve_key = owned.clone();
+            let generation = self.feed.current();
+
+            let entry = self
+                .resolved
+                .try_get_with(owned, async move {
+                    let resolution = tokio::task::spawn_blocking(move || {
+                        let canonical = path::resolve_blocking(&base, &resolve_key)?;
+                        let aliased = !path::spells(&base, &canonical, &resolve_key);
+
+                        Ok::<_, AppError>(Resolution {
+                            canonical: Arc::from(canonical),
+                            aliased,
+                        })
+                    })
+                    .await??;
+
+                    Ok::<_, AppError>(Stamped::new(resolution, generation))
+                })
+                .await?;
+
+            (entry, Origin::Filesystem)
+        };
+
+        let vouched = self.vouch(&entry);
+
+        if !vouched {
+            self.resolved.invalidate(key).await;
         }
 
-        let base = self.base.clone();
-        let owned = key.to_owned();
-        let resolve_key = owned.clone();
+        let freshness = Freshness::of(vouched && !entry.value.aliased);
 
-        let canonical = self
-            .resolved
-            .try_get_with(owned, async move {
-                let resolved = tokio::task::spawn_blocking(move || {
-                    path::resolve_blocking(&base, &resolve_key)
-                })
-                .await??;
-
-                Ok::<Arc<Path>, AppError>(Arc::from(resolved))
-            })
-            .await?;
-
-        Ok((canonical, Origin::Filesystem))
+        Ok((Arc::clone(&entry.value.canonical), origin, freshness))
     }
 
-    async fn dir_node(&self, canonical: &Path) -> Result<(Arc<DirNode>, Origin), AppError> {
-        if let Some(node) = self.dirs.get(canonical).await {
-            return Ok((node, Origin::Cache));
+    async fn dir_node(
+        &self,
+        canonical: &Path,
+    ) -> Result<(Arc<DirNode>, Origin, Freshness), AppError> {
+        let (entry, origin) = if let Some(entry) = self.dirs.get(canonical).await {
+            (entry, Origin::Cache)
+        } else {
+            let cache_key = canonical.to_path_buf();
+            let scan_path = cache_key.clone();
+            let generation = self.feed.current();
+
+            let entry = self
+                .dirs
+                .try_get_with(cache_key, async move {
+                    let node =
+                        tokio::task::spawn_blocking(move || DirNode::scan(&scan_path)).await??;
+
+                    Ok::<_, AppError>(Stamped::new(Arc::new(node), generation))
+                })
+                .await?;
+
+            (entry, Origin::Filesystem)
+        };
+
+        let vouched = self.vouch(&entry);
+
+        if !vouched {
+            self.dirs.invalidate(canonical).await;
         }
 
-        let cache_key = canonical.to_path_buf();
-        let scan_path = cache_key.clone();
+        Ok((Arc::clone(&entry.value), origin, Freshness::of(vouched)))
+    }
 
-        let node = self
-            .dirs
-            .try_get_with(cache_key, async move {
-                let node = tokio::task::spawn_blocking(move || DirNode::scan(&scan_path)).await??;
-
-                Ok::<Arc<DirNode>, AppError>(Arc::new(node))
-            })
-            .await?;
-
-        Ok((node, Origin::Filesystem))
+    /// The watch is in place, so the feed can start vouching. Whatever was
+    /// loaded before it was may already be stale with no event to say so:
+    /// drop it under a new generation, so a load still running is overtaken,
+    /// and start every client over from there.
+    pub fn go_live(&self) {
+        let generation = self.feed.begin();
+        self.invalidate_all();
+        self.feed.go_live();
+        self.feed.publish_reset(generation);
     }
 
     /// Drop everything. Used when the watcher reports it lost track of events.
@@ -540,9 +738,12 @@ impl Store {
 
     /// A file's bytes changed but its position in the tree did not: drop its
     /// contents and the parent listing that quotes its size and timestamps.
-    /// Resolutions stay valid, so this is O(1) and leaves the hot path warm.
+    /// A directory's node holds its own too, which is where the served root's
+    /// are answered from. Resolutions stay valid, so this is O(1) and leaves
+    /// the hot path warm.
     pub async fn invalidate_content(&self, path: &Path) {
         self.contents.invalidate(path).await;
+        self.dirs.invalidate(path).await;
 
         if let Some(parent) = path.parent() {
             self.dirs.invalidate(parent).await;
@@ -553,13 +754,19 @@ impl Store {
     /// subtrees, so anything that resolved at or *through* one of `roots` has to
     /// go - including resolutions, which can only be matched on the canonical
     /// path they produced, since their keys are request strings.
-    pub async fn invalidate_subtree(&self, roots: Vec<PathBuf>) {
-        for root in &roots {
+    pub async fn invalidate_subtree(&self, roots: &[PathBuf]) {
+        for root in roots {
             self.dirs.invalidate(root).await;
             self.contents.invalidate(root).await;
 
+            // The parent's times changed with its entries, and its own parent
+            // lists those times.
             if let Some(parent) = root.parent() {
                 self.dirs.invalidate(parent).await;
+
+                if let Some(grandparent) = parent.parent() {
+                    self.dirs.invalidate(grandparent).await;
+                }
             }
         }
 
@@ -583,7 +790,10 @@ impl Store {
         }
 
         for (key, value) in &self.resolved {
-            if roots.iter().any(|root| value.starts_with(root)) {
+            if roots
+                .iter()
+                .any(|root| value.value.canonical.starts_with(root))
+            {
                 self.resolved.invalidate(&*key).await;
             }
         }
@@ -594,6 +804,20 @@ impl Store {
 /// tests use to assert on cache state directly.
 #[cfg(test)]
 impl Store {
+    /// Cache a listing stamped as if its load began at `generation`, without
+    /// vouching for it: the state a load leaves behind when a generation
+    /// begins while it runs, which no test can otherwise time.
+    ///
+    /// # Panics
+    ///
+    /// If `canonical` cannot be scanned.
+    pub async fn plant_directory(&self, canonical: &Path, generation: u64) {
+        let node = DirNode::scan(canonical).expect("scan");
+        self.dirs
+            .insert(canonical.to_path_buf(), Stamped::new(Arc::new(node), generation))
+            .await;
+    }
+
     /// Forget one directory's listing.
     pub async fn invalidate_directory(&self, canonical: &Path) {
         self.dirs.invalidate(canonical).await;
@@ -685,36 +909,48 @@ fn truncate_to_seconds(time: std::time::SystemTime) -> std::time::SystemTime {
         })
 }
 
-/// Translate a debounced batch of filesystem events into cache invalidations.
+/// Translate a debounced batch of filesystem events into cache invalidations,
+/// and publish the batch to the change feed as one generation.
 ///
 /// Events are split by what they actually invalidate. Content changes are the
 /// common case and stay O(1); only structural changes - which can move whole
 /// subtrees - pay for a predicate sweep.
+///
+/// The generation begins before the first invalidation and is published after
+/// the last, which is the order [`Stamped`] depends on: a load that began
+/// before the batch is seen to have been overtaken, and a client that sees the
+/// batch can trust anything it reads afterwards to reflect it.
 pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], store: &Store) {
     use notify_debouncer_full::notify::EventKind;
     use notify_debouncer_full::notify::event::ModifyKind;
 
     let mut content_changes: HashSet<PathBuf> = HashSet::new();
-    let mut structural: Vec<PathBuf> = Vec::new();
+    let mut structural: HashSet<PathBuf> = HashSet::new();
 
     for event in events {
         crate::log_trace!("Processing file watch event: {:?}", event);
 
         if event.need_rescan() {
             crate::log_warn!("File watch rescan flag received, dropping all cached state");
+            let generation = store.feed.begin();
             store.invalidate_all();
+            store.feed.publish_reset(generation);
             return;
         }
 
         match event.kind {
-            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
-                content_changes.extend(event.paths.iter().cloned());
-            }
-
             // Creates, removes and renames all change what a path *means*, and
             // a rename event carries both the old and the new path.
-            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_)) => {
                 structural.extend(event.paths.iter().cloned());
+            }
+
+            // Every other modification, including the `Any` that Windows
+            // reports for an in-place write, leaves the tree as it was.
+            EventKind::Modify(_) => {
+                content_changes.extend(event.paths.iter().cloned());
             }
 
             _ => {
@@ -723,13 +959,54 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
         }
     }
 
+    if content_changes.is_empty() && structural.is_empty() {
+        return;
+    }
+
+    let generation = store.feed.begin();
+
     for path in &content_changes {
         store.invalidate_content(path).await;
     }
 
+    let structural: Vec<PathBuf> = structural.into_iter().collect();
+    let contents = store.feed_keys(content_changes.iter());
+    let structure = store.feed_keys(structural.iter());
+
     if !structural.is_empty() {
-        store.invalidate_subtree(structural).await;
+        store.invalidate_subtree(&structural).await;
     }
+
+    let (Some(contents), Some(structure)) = (contents, structure) else {
+        store.feed.publish_reset(generation);
+        return;
+    };
+
+    // Whether a structural path was created or removed is decided by whether
+    // it exists now, after the batch: a rename reports both of its paths, and
+    // only this tells the old one from the new.
+    let exists = tokio::task::spawn_blocking(move || {
+        structural
+            .iter()
+            .map(|path| path.symlink_metadata().is_ok())
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    let Ok(exists) = exists else {
+        store.feed.publish_reset(generation);
+        return;
+    };
+
+    let changes = contents
+        .into_iter()
+        .map(|key| (key, Kind::Modified))
+        .chain(structure.into_iter().zip(exists).map(|(key, exists)| {
+            (key, if exists { Kind::Created } else { Kind::Removed })
+        }))
+        .collect();
+
+    store.feed.publish(generation, changes);
 }
 
 #[cfg(test)]

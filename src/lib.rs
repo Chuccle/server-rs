@@ -48,6 +48,35 @@ pub fn extract_path(uri: &axum::http::Uri) -> Result<std::borrow::Cow<'_, str>, 
     Err(AppError::BadRequest)
 }
 
+/// Reads one unsigned integer query parameter, or `None` if `name` is absent
+/// or its value is not a decimal `u64`.
+fn query_u64(uri: &axum::http::Uri, name: &str) -> Option<u64> {
+    uri.query()?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))?
+        .parse()
+        .ok()
+}
+
+/// A metadata answer, marked `no-store` when the change feed cannot vouch for
+/// it (see [`utils::cache::Freshness`]).
+fn answer(body: bytes::Bytes, freshness: utils::cache::Freshness) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let mut response = body.into_response();
+    mark(&mut response, freshness);
+    response
+}
+
+fn mark(response: &mut axum::response::Response, freshness: utils::cache::Freshness) {
+    if freshness == utils::cache::Freshness::Unvouched {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+}
+
 /// Handlers own nothing but the cache tier and the counters; everything a
 /// request needs is reachable through [`utils::cache::Store`].
 pub struct AppState {
@@ -75,14 +104,14 @@ impl AppState {
 pub async fn get_dir_entry_info_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     uri: axum::http::Uri,
-) -> Result<bytes::Bytes, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let path = extract_path(&uri)?;
     log_debug!("[FILE INFO] Handling request for: {path}");
 
-    let (encoded, origin) = data.store.entry_metadata(&path).await?;
+    let (encoded, origin, freshness) = data.store.entry_metadata(&path).await?;
     data.cache_stats.record(origin);
 
-    Ok(encoded)
+    Ok(answer(encoded, freshness))
 }
 
 /// `GET /get_dir_info` - the serialised listing for a directory.
@@ -93,14 +122,43 @@ pub async fn get_dir_entry_info_handler(
 pub async fn get_dir_info_handler(
     axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
     uri: axum::http::Uri,
-) -> Result<bytes::Bytes, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let path = extract_path(&uri)?;
     log_debug!("[DIR INFO] Handling request for: {path}");
 
-    let (encoded, origin) = data.store.directory_listing(&path).await?;
+    let (encoded, origin, freshness) = data.store.directory_listing(&path).await?;
     data.cache_stats.record(origin);
 
-    Ok(encoded)
+    Ok(answer(encoded, freshness))
+}
+
+/// `GET /get_changes?epoch=E&since=G` - what changed after generation `G`.
+///
+/// Held until something has when nothing has yet. See [`utils::feed`] for the
+/// contract. A client with no epoch yet sends none (or `0`) and is answered
+/// with a reset carrying the current generation.
+///
+/// # Errors
+///
+/// [`AppError::FeedUnavailable`] while the watcher is not running, which tells
+/// a client to fall back to expiring what it caches.
+pub async fn get_changes_handler(
+    axum::extract::State(data): axum::extract::State<std::sync::Arc<AppState>>,
+    uri: axum::http::Uri,
+) -> Result<axum::response::Response, AppError> {
+    let epoch = query_u64(&uri, "epoch").unwrap_or(0);
+    let since = query_u64(&uri, "since").unwrap_or(0);
+    let feed = data.store.feed();
+
+    let batch = feed
+        .poll(epoch, since)
+        .await
+        .ok_or(AppError::FeedUnavailable)?;
+
+    Ok(answer(
+        batch.encode(feed.epoch()),
+        utils::cache::Freshness::Unvouched,
+    ))
 }
 
 /// `GET`/`HEAD /get_file` - file contents, from memory when resident.
@@ -118,28 +176,30 @@ pub async fn get_file_handler(
     let path = extract_path(request.uri())?.into_owned();
     log_debug!("[FILE READ] Handling request for: {path}");
 
-    let (canonical, content, origin) = data.store.file_content(&path).await?;
+    let (canonical, content, origin, freshness) = data.store.file_content(&path).await?;
     data.cache_stats.record(origin);
 
-    match content {
+    let mut response = match content {
         // Answered entirely from memory: no open, no read, no page-cache round
         // trip, and the body is a slice of a buffer we already hold.
-        utils::cache::Content::Resident(node) => Ok(utils::http::resident_response(
-            &node,
-            request.method(),
-            request.headers(),
-        )),
+        utils::cache::Content::Resident(node) => {
+            utils::http::resident_response(&node, request.method(), request.headers())
+        }
 
         // Too large to hold resident, so hand it to the streaming file service.
         utils::cache::Content::Streamed => {
             use axum::response::IntoResponse as _;
 
-            Ok(tower_http::services::ServeFile::new(&canonical)
+            tower_http::services::ServeFile::new(&canonical)
                 .try_call(request)
                 .await?
-                .into_response())
+                .into_response()
         }
-    }
+    };
+
+    mark(&mut response, freshness);
+
+    Ok(response)
 }
 
 /// Every route the server serves, in one place, so that tests and benchmarks
@@ -151,6 +211,7 @@ pub fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
             axum::routing::get(get_dir_entry_info_handler),
         )
         .route("/get_dir_info", axum::routing::get(get_dir_info_handler))
+        .route("/get_changes", axum::routing::get(get_changes_handler))
         .route("/get_file", axum::routing::get(get_file_handler))
         .route("/get_file", axum::routing::head(get_file_handler))
         .route(
@@ -250,16 +311,26 @@ pub fn resolve_base_path(argument: &str) -> std::path::PathBuf {
     }
 }
 
-/// Watches `path` recursively, feeding file-system events to the cache.
+/// Watches `path` recursively, feeding file-system events to the cache and the
+/// change feed.
 ///
 /// `path` must be the canonical root: `notify` builds event paths by joining
 /// the watched root with the on-disk name, so watching the canonical form is
 /// what makes event paths line up with the cache keys they invalidate.
+///
+/// The feed goes live only once the watch is in place, and stops for good on
+/// the first error the watcher reports: an error means events may have been
+/// lost (a directory it could not add a watch for, say), and a feed that might
+/// be missing changes must not tell clients there were none.
+///
+/// On Windows it never goes live. When `ReadDirectoryChangesW` overflows its
+/// buffer, `notify` stops watching without reporting an error or a rescan, so
+/// the feed would go on vouching for a tree nobody is watching.
 pub fn start_fs_watcher(path: std::path::PathBuf, state: std::sync::Arc<AppState>) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
 
-        let mut debouncer = notify_debouncer_full::new_debouncer(
+        let watching = notify_debouncer_full::new_debouncer(
             tokio::time::Duration::from_secs(2),
             None,
             move |res| {
@@ -267,23 +338,44 @@ pub fn start_fs_watcher(path: std::path::PathBuf, state: std::sync::Arc<AppState
                     log_error_with_context!(e, "watch send error");
                 }
             },
-        )?;
+        )
+        .and_then(|mut debouncer| {
+            debouncer
+                .watch(
+                    &path,
+                    notify_debouncer_full::notify::RecursiveMode::Recursive,
+                )
+                .map(|()| debouncer)
+        });
 
-        debouncer.watch(
-            &path,
-            notify_debouncer_full::notify::RecursiveMode::Recursive,
-        )?;
+        // Held for the life of the loop: dropping the debouncer stops the watch.
+        let _debouncer = match watching {
+            Ok(debouncer) => debouncer,
+            Err(e) => {
+                log_error_with_context!(e, "Failed to watch {:?}; the change feed stays off", path);
+                return;
+            }
+        };
+
+        if cfg!(windows) {
+            log_warn!("The change feed is not supported on Windows and stays off");
+        } else {
+            state.store.go_live();
+        }
 
         while let Some(res) = rx.recv().await {
             match res {
                 Ok(events) => utils::cache::handle_fs_events(&events, &state.store).await,
-                Err(e) => {
-                    log_error_with_context!(e, "watch receive error");
+                Err(errors) => {
+                    for e in errors {
+                        log_error_with_context!(e, "watch receive error; the change feed stops");
+                    }
+
+                    state.store.invalidate_all();
+                    state.store.feed().fail();
                 }
             }
         }
-
-        Ok::<(), notify_debouncer_full::notify::Error>(())
     });
 }
 
@@ -2213,7 +2305,7 @@ mod tests {
             let state = setup_test_env(temp.path());
             let root = primed(&state, "").await;
 
-            let (target, content, _) = state.store.file_content("test_file.txt").await.unwrap();
+            let (target, content, _, _) = state.store.file_content("test_file.txt").await.unwrap();
             assert!(matches!(content, utils::cache::Content::Resident(_)));
             assert!(state.store.has_content(&target));
 
@@ -2240,7 +2332,7 @@ mod tests {
             let state = setup_test_env(temp.path());
             let root = primed(&state, "").await;
 
-            let (target, _, _) = state.store.file_content("test_file.txt").await.unwrap();
+            let (target, _, _, _) = state.store.file_content("test_file.txt").await.unwrap();
 
             let events = [event(
                 EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
@@ -2259,7 +2351,7 @@ mod tests {
             let state = setup_test_env(temp.path());
             let root = primed(&state, "").await;
 
-            let (target, _, _) = state.store.file_content("test_file.txt").await.unwrap();
+            let (target, _, _, _) = state.store.file_content("test_file.txt").await.unwrap();
             assert!(state.store.has_content(&target));
 
             let events = [event(
@@ -2327,7 +2419,7 @@ mod tests {
 
             let root = primed(&state, "").await;
             let sub_dir = primed(&state, "test_dir").await;
-            let (target, _, _) = state.store.file_content("test_file.txt").await.unwrap();
+            let (target, _, _, _) = state.store.file_content("test_file.txt").await.unwrap();
 
             let mut rescan = Event::new(EventKind::Other);
             rescan = rescan.set_flag(Flag::Rescan);
@@ -2349,6 +2441,62 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn create_invalidates_the_grandparent_listing() {
+            // The create changed the parent's times, which the grandparent's
+            // listing quotes.
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let root = primed(&state, "").await;
+            let sub_dir = primed(&state, "test_dir").await;
+
+            let new_file = sub_dir.join("new_file.txt");
+            let events = [event(EventKind::Create(CreateKind::File), &[&new_file])];
+
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert!(!state.store.has_directory(&sub_dir));
+            assert!(!state.store.has_directory(&root));
+        }
+
+        #[tokio::test]
+        async fn metadata_modification_of_the_root_invalidates_its_own_listing() {
+            // The root has no parent listing to quote its times; its own node
+            // answers for them.
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let root = primed(&state, "").await;
+
+            let events = [event(
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                &[&root],
+            )];
+
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert!(!state.store.has_directory(&root));
+        }
+
+        #[tokio::test]
+        async fn a_modification_of_unknown_kind_leaves_the_subtree_in_place() {
+            // Windows reports an in-place write as `Modify(Any)`, which must
+            // not cost every cached entry beneath the path.
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let root = primed(&state, "").await;
+            let sub_dir = primed(&state, "test_dir").await;
+            let nested = primed(&state, "test_dir/nested_test_dir").await;
+
+            for kind in [ModifyKind::Any, ModifyKind::Other] {
+                let events = [event(EventKind::Modify(kind), &[&sub_dir])];
+
+                utils::cache::handle_fs_events(&events, &state.store).await;
+            }
+
+            assert!(!state.store.has_directory(&root));
+            assert!(state.store.has_directory(&nested));
+        }
+
+        #[tokio::test]
         async fn unrelated_event_kinds_do_not_invalidate_anything() {
             let temp = tempfile::tempdir().unwrap();
             let state = setup_test_env(temp.path());
@@ -2366,6 +2514,513 @@ mod tests {
                 state.store.has_directory(&root),
                 "a plain access should not evict anything"
             );
+        }
+    }
+
+    /// The change feed, end to end through the router, and the coherence rule
+    /// it rests on: an answer the feed cannot vouch for goes out `no-store`.
+    ///
+    /// Events are fed to `handle_fs_events` directly, for the reason the
+    /// `file_watcher` tests give; what is under test is what a client polling
+    /// `/get_changes` is told, and what the metadata routes mark.
+    mod change_feed {
+        use super::*;
+        use generated::blorg_meta_flat::ChangeBatch;
+        use notify_debouncer_full::DebouncedEvent;
+        use notify_debouncer_full::notify::event::{
+            CreateKind, DataChange, Flag, ModifyKind, RemoveKind, RenameMode,
+        };
+        use notify_debouncer_full::notify::{Event, EventKind};
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Batch {
+            epoch: u64,
+            generation: u64,
+            reset: bool,
+            modified: Vec<String>,
+            created: Vec<String>,
+            removed: Vec<String>,
+        }
+
+        fn event(kind: EventKind, paths: &[&std::path::Path]) -> DebouncedEvent {
+            let event = paths
+                .iter()
+                .fold(Event::new(kind), |event, path| event.add_path(path.to_path_buf()));
+
+            DebouncedEvent::new(event, std::time::Instant::now())
+        }
+
+        fn modified(state: &AppState, relative: &str) -> DebouncedEvent {
+            event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &[&canonical(state, relative)],
+            )
+        }
+
+        fn created(state: &AppState, relative: &str) -> DebouncedEvent {
+            fs::create_dir(canonical(state, relative)).unwrap();
+
+            event(
+                EventKind::Create(CreateKind::Folder),
+                &[&canonical(state, relative)],
+            )
+        }
+
+        fn renamed(state: &AppState, from: &str, to: &str) -> DebouncedEvent {
+            fs::rename(canonical(state, from), canonical(state, to)).unwrap();
+
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &[&canonical(state, from), &canonical(state, to)],
+            )
+        }
+
+        fn removed(state: &AppState, relative: &str) -> DebouncedEvent {
+            fs::remove_file(canonical(state, relative)).unwrap();
+
+            event(
+                EventKind::Remove(RemoveKind::File),
+                &[&canonical(state, relative)],
+            )
+        }
+
+        fn live(config: utils::cache::Config) -> (tempfile::TempDir, Arc<AppState>) {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("test_dir")).unwrap();
+            fs::create_dir(temp.path().join("other_test_dir")).unwrap();
+            File::create(temp.path().join("test_dir/file_in_dir.txt"))
+                .unwrap()
+                .write_all(b"nested content")
+                .unwrap();
+
+            let state = state_with_config(temp.path(), config);
+            state.store.feed().go_live();
+
+            (temp, state)
+        }
+
+        async fn get(state: &Arc<AppState>, uri: &str) -> axum::response::Response {
+            build_router(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        fn no_store(response: &axum::response::Response) -> bool {
+            response
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .is_some_and(|value| value == "no-store")
+        }
+
+        async fn poll(state: &Arc<AppState>, epoch: u64, since: u64) -> Batch {
+            let response = get(state, &format!("/get_changes?epoch={epoch}&since={since}")).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+
+            let bytes = response.collect().await.unwrap().to_bytes();
+            let batch = flatbuffers::root::<ChangeBatch>(&bytes).unwrap();
+            let strings = |paths: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<&str>>>| {
+                let mut paths: Vec<String> =
+                    paths.unwrap().iter().map(str::to_owned).collect();
+                paths.sort();
+                paths
+            };
+
+            Batch {
+                epoch: batch.epoch(),
+                generation: batch.generation(),
+                reset: batch.reset(),
+                modified: strings(batch.modified()),
+                created: strings(batch.created()),
+                removed: strings(batch.removed()),
+            }
+        }
+
+        #[tokio::test]
+        async fn refuses_to_answer_until_the_watcher_is_live() {
+            // An empty batch would tell the client nothing changed, which is a
+            // promise only a running watcher can make.
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+
+            let response = get(&state, "/get_changes").await;
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn a_new_client_is_told_to_reset_at_the_current_generation() {
+            let (_temp, state) = live(utils::cache::Config::default());
+
+            let batch = poll(&state, 0, 0).await;
+
+            assert!(batch.reset);
+            assert_eq!(batch.epoch, state.store.feed().epoch());
+            assert_eq!(batch.generation, 0);
+        }
+
+        #[tokio::test]
+        async fn a_batch_names_what_changed_the_way_a_client_asked_for_it() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let events = [
+                modified(&state, "test_dir/file_in_dir.txt"),
+                created(&state, "test_dir/new_dir"),
+            ];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert_eq!(
+                poll(&state, epoch, 0).await,
+                Batch {
+                    epoch,
+                    generation: 1,
+                    reset: false,
+                    modified: vec!["test_dir/file_in_dir.txt".to_owned()],
+                    created: vec!["test_dir/new_dir".to_owned()],
+                    removed: Vec::new(),
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn a_rename_reports_its_old_path_removed_and_its_new_one_created() {
+            // The client keys everything by path, so a rename is two facts to
+            // it: the old name no longer resolves, and the new one now does.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let events = [renamed(&state, "test_dir", "moved_dir")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert_eq!(batch.modified, Vec::<String>::new());
+            assert_eq!(batch.created, vec!["moved_dir".to_owned()]);
+            assert_eq!(batch.removed, vec!["test_dir".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn a_change_of_existence_outranks_a_later_modification() {
+            // A client that missed the create still has to hear that the path
+            // now exists, even when a write to it came after; reporting only
+            // the write would leave its cached "not found" in place.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let events = [created(&state, "test_dir/new_dir")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+            let events = [modified(&state, "test_dir/new_dir")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert_eq!(batch.generation, 2);
+            assert_eq!(batch.modified, Vec::<String>::new());
+            assert_eq!(batch.created, vec!["test_dir/new_dir".to_owned()]);
+
+            let since_the_create = poll(&state, epoch, 1).await;
+            assert_eq!(since_the_create.modified, vec!["test_dir/new_dir".to_owned()]);
+            assert_eq!(since_the_create.created, Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_removal_is_reported_as_one() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let events = [removed(&state, "test_dir/file_in_dir.txt")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert!(batch.modified.is_empty() && batch.created.is_empty());
+            assert_eq!(batch.removed, vec!["test_dir/file_in_dir.txt".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn a_path_changed_in_several_generations_is_sent_once() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            for _ in 0..3 {
+                let events = [modified(&state, "test_dir/file_in_dir.txt")];
+                utils::cache::handle_fs_events(&events, &state.store).await;
+            }
+
+            let batch = poll(&state, epoch, 0).await;
+
+            assert_eq!(batch.generation, 3);
+            assert_eq!(batch.modified, vec!["test_dir/file_in_dir.txt".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn a_client_that_is_up_to_date_is_held_until_something_changes() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let waiting = tokio::spawn({
+                let state = state.clone();
+                async move { poll(&state, epoch, 0).await }
+            });
+
+            // Give the poll time to start waiting; if it answered early it
+            // would have an empty batch, which the assertion below rejects.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let events = [modified(&state, "test_dir/file_in_dir.txt")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .expect("the held poll should be answered by the change, not the hold")
+                .unwrap();
+
+            assert_eq!(batch.generation, 1);
+            assert_eq!(batch.modified, vec!["test_dir/file_in_dir.txt".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn the_heartbeat_is_an_empty_batch_at_the_same_generation() {
+            let (_temp, state) = live(utils::cache::Config {
+                feed_hold: std::time::Duration::from_millis(20),
+                ..utils::cache::Config::default()
+            });
+            let epoch = state.store.feed().epoch();
+
+            let batch = poll(&state, epoch, 0).await;
+
+            assert!(!batch.reset);
+            assert_eq!(batch.generation, 0);
+            assert!(batch.modified.is_empty() && batch.created.is_empty() && batch.removed.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_client_behind_what_is_retained_is_told_to_reset() {
+            let (_temp, state) = live(utils::cache::Config {
+                feed_retained: 1,
+                ..utils::cache::Config::default()
+            });
+            let epoch = state.store.feed().epoch();
+
+            for relative in ["test_dir", "other_test_dir"] {
+                let events = [modified(&state, relative)];
+                utils::cache::handle_fs_events(&events, &state.store).await;
+            }
+
+            assert!(poll(&state, epoch, 0).await.reset);
+
+            let caught_up = poll(&state, epoch, 1).await;
+            assert!(!caught_up.reset);
+            assert_eq!(caught_up.modified, vec!["other_test_dir".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn another_epoch_is_told_to_reset() {
+            // A restarted server numbers generations from zero again, so a
+            // client's generation from the previous process means nothing.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            assert!(poll(&state, epoch ^ 2, 0).await.reset);
+        }
+
+        #[tokio::test]
+        async fn a_rescan_resets_every_client() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+            let events = [DebouncedEvent::new(rescan, std::time::Instant::now())];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert!(batch.reset);
+            assert_eq!(batch.generation, 1);
+        }
+
+        #[tokio::test]
+        async fn a_watcher_failure_stops_the_feed() {
+            let (_temp, state) = live(utils::cache::Config::default());
+
+            state.store.feed().fail();
+
+            let response = get(&state, "/get_changes").await;
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn a_modification_of_unknown_kind_is_reported_as_modified() {
+            // What Windows reports for an in-place write.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let events = [event(
+                EventKind::Modify(ModifyKind::Any),
+                &[&canonical(&state, "test_dir/file_in_dir.txt")],
+            )];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert_eq!(batch.modified, vec!["test_dir/file_in_dir.txt".to_owned()]);
+            assert!(batch.created.is_empty() && batch.removed.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_path_repeated_in_one_batch_takes_one_retained_slot() {
+            let (_temp, state) = live(utils::cache::Config {
+                feed_retained: 1,
+                ..utils::cache::Config::default()
+            });
+            let epoch = state.store.feed().epoch();
+
+            let events = [
+                created(&state, "test_dir/new_dir"),
+                event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                    &[&canonical(&state, "test_dir/new_dir")],
+                ),
+            ];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert!(!batch.reset);
+            assert_eq!(batch.created, vec!["test_dir/new_dir".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn a_batch_naming_a_path_outside_the_root_is_a_reset() {
+            // No client could have asked for it by a key, so the batch cannot
+            // be reported precisely.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+            let outside = tempfile::tempdir().unwrap();
+
+            let events = [
+                modified(&state, "test_dir/file_in_dir.txt"),
+                event(
+                    EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                    &[&outside.path().join("elsewhere.txt")],
+                ),
+            ];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            let batch = poll(&state, epoch, 0).await;
+            assert!(batch.reset);
+            assert_eq!(batch.generation, 1);
+        }
+
+        #[tokio::test]
+        async fn a_held_poll_is_refused_when_the_watcher_fails() {
+            let (_temp, state) = live(utils::cache::Config::default());
+            let epoch = state.store.feed().epoch();
+
+            let waiting = tokio::spawn({
+                let state = state.clone();
+                async move { get(&state, &format!("/get_changes?epoch={epoch}&since=0")).await }
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            state.store.feed().fail();
+
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .expect("the held poll should be answered by the failure, not the hold")
+                .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn going_live_drops_what_was_loaded_before_the_watch() {
+            // No event will report a change made before the watch was in
+            // place, so nothing loaded by then may be vouched for after.
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let epoch = state.store.feed().epoch();
+            let directory = canonical(&state, "test_dir");
+
+            state.store.directory_listing("test_dir").await.unwrap();
+            assert!(state.store.has_directory(&directory));
+
+            state.store.go_live();
+
+            assert!(!state.store.has_directory(&directory));
+
+            let batch = poll(&state, epoch, 0).await;
+            assert!(batch.reset);
+            assert_eq!(batch.generation, 1);
+
+            // A load that began before going live is overtaken.
+            state.store.plant_directory(&directory, 0).await;
+            assert!(no_store(&get(&state, "/get_dir_info?path=test_dir").await));
+        }
+
+        #[cfg(not(windows))]
+        #[tokio::test]
+        async fn the_watcher_takes_the_feed_live_once_it_is_watching() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+
+            start_fs_watcher(state.store.base().to_path_buf(), state.clone());
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !state.store.feed().is_live() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the feed should go live once the watch is in place");
+        }
+
+        #[tokio::test]
+        async fn a_load_overtaken_by_a_generation_is_served_once_and_not_kept() {
+            // Without the stamp, this entry - read before the change, cached
+            // after its invalidation - would be served as current until its
+            // TTL, and a client that had already applied the change would keep
+            // it for good.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let directory = canonical(&state, "test_dir");
+
+            state.store.plant_directory(&directory, 0).await;
+            state.store.feed().begin();
+
+            let response = get(&state, "/get_dir_info?path=test_dir").await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert!(no_store(&response));
+            assert!(!state.store.has_directory(&directory));
+
+            let reloaded = get(&state, "/get_dir_info?path=test_dir").await;
+            assert!(!no_store(&reloaded));
+            assert!(state.store.has_directory(&directory));
+        }
+
+        #[tokio::test]
+        async fn a_vouched_entry_outlives_a_generation_that_did_not_touch_it() {
+            // The stamp must not cost the cache its point: only a load a
+            // generation overtook is distrusted, not every entry older than
+            // the newest generation.
+            let (_temp, state) = live(utils::cache::Config::default());
+            let directory = canonical(&state, "test_dir");
+
+            assert!(!no_store(&get(&state, "/get_dir_info?path=test_dir").await));
+
+            let events = [modified(&state, "other_test_dir")];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert!(state.store.has_directory(&directory));
+            assert!(!no_store(&get(&state, "/get_dir_info?path=test_dir").await));
+            assert!(!no_store(&get(&state, "/get_dir_entry_info?path=test_dir/file_in_dir.txt").await));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_answer_reached_through_a_symlink_is_never_vouched_for() {
+            // The watcher names the target; a client caching under the link's
+            // name would never hear about it.
+            let (temp, state) = live(utils::cache::Config::default());
+            std::os::unix::fs::symlink(temp.path().join("test_dir"), temp.path().join("alias"))
+                .unwrap();
+
+            assert!(no_store(&get(&state, "/get_dir_info?path=alias").await));
+            assert!(no_store(&get(&state, "/get_dir_entry_info?path=alias/file_in_dir.txt").await));
+            assert!(no_store(&get(&state, "/get_file?path=alias/file_in_dir.txt").await));
+            assert!(!no_store(&get(&state, "/get_dir_info?path=test_dir").await));
         }
     }
 }
