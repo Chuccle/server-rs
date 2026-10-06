@@ -47,6 +47,7 @@ use crate::utils::feed::{Feed, Kind};
 use crate::utils::hash::RandomState;
 use crate::utils::{flat, meta::RawMeta, path};
 use bytes::Bytes;
+use futures_util::future::join_all;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -299,6 +300,28 @@ impl DirNode {
         self.own
     }
 
+    /// How many entries the listing holds.
+    #[inline]
+    pub fn entries(&self) -> usize {
+        self.metas.len()
+    }
+
+    /// Every child in name order, the order the listing holds them in.
+    pub fn children(&self) -> impl Iterator<Item = (&str, RawMeta)> {
+        self.metas
+            .iter()
+            .enumerate()
+            .filter_map(|(child, meta)| Some((self.name_of(child)?, *meta)))
+    }
+
+    /// The subdirectories in the order of the listing's `subdirectories`, so
+    /// the position of each is its index there.
+    pub fn subdirectories(&self) -> impl Iterator<Item = &str> {
+        self.children()
+            .filter(|(_, meta)| meta.is_dir)
+            .map(|(name, _)| name)
+    }
+
     /// Metadata for one child, by its exact on-disk name.
     ///
     /// Callers pass the name taken from a canonical path, which already carries
@@ -430,6 +453,7 @@ pub struct Store {
     dirs: PathCache<Arc<DirNode>>,
     contents: PathCache<Content>,
     feed: Feed,
+    subtree_lookups: tokio::sync::Semaphore,
 }
 
 /// Rough fixed cost of one resolution entry: two allocations plus the cache's
@@ -438,6 +462,11 @@ const RESOLVED_OVERHEAD: u32 = 96;
 
 /// Nominal weight of a "stream this one" decision, which holds no data.
 const STREAMED_WEIGHT: u32 = 64;
+
+/// Sibling directories a subtree answer looks up at once, and the most lookups
+/// all subtree answers have in flight together. Each lookup is a blocking-pool
+/// task or two, so this bounds how much of the pool they can hold.
+const SUBTREE_BATCH: usize = 32;
 
 impl Store {
     /// # Errors
@@ -486,6 +515,7 @@ impl Store {
             dirs,
             contents,
             feed: Feed::new(config.feed_retained, config.feed_hold),
+            subtree_lookups: tokio::sync::Semaphore::new(SUBTREE_BATCH),
         })
     }
 
@@ -543,6 +573,121 @@ impl Store {
         let (node, scanned, listed) = self.dir_node(&canonical).await?;
 
         Ok((node.listing(), resolved.and(scanned), named.and(listed)))
+    }
+
+    /// Serialised listing for a directory, carrying the listings beneath it
+    /// breadth first for as long as their entries fit in `budget`. The root
+    /// costs its entries and each listing beneath it its entries plus one, so
+    /// empty directories are not free.
+    ///
+    /// A subdirectory that cannot be resolved or listed is left out rather
+    /// than failing the whole answer; asking for it alone reports why. So is
+    /// one the feed cannot vouch for, along with everything beneath it, so
+    /// that the rest of the answer can still be kept. The walk stops at the
+    /// first listing that does not fit, so what is included is always every
+    /// directory nearer the root than what is not.
+    ///
+    /// The directories at each depth are looked up `SUBTREE_BATCH` at a time,
+    /// so a cold subtree costs a few disk round trips per depth rather than
+    /// one per directory, and no batch is larger than what is left of the
+    /// budget could take. Subtree answers between them have at most
+    /// `SUBTREE_BATCH` lookups in flight.
+    ///
+    /// # Errors
+    ///
+    /// Traversal, missing path, or an unreadable directory, for the directory
+    /// asked for itself.
+    pub async fn directory_subtree(
+        &self,
+        raw: &str,
+        budget: usize,
+    ) -> Result<(Bytes, Origin, Freshness), AppError> {
+        let key = path::normalize(raw)?;
+        let (canonical, resolved, named) = self.resolve(&key).await?;
+        let (root, scanned, listed) = self.dir_node(&canonical).await?;
+
+        let mut origin = resolved.and(scanned);
+        let freshness = named.and(listed);
+        let mut remaining = budget.saturating_sub(root.entries());
+        let mut levels = vec![(key.into_owned(), root)];
+        let mut descendants = Vec::new();
+        let mut depth = 0..levels.len();
+
+        // One depth at a time: every directory at it is listed already, and
+        // their children make up the next.
+        'walk: while !depth.is_empty() {
+            let mut children = Vec::new();
+
+            for (parent, (dir_key, node)) in levels[depth.clone()].iter().enumerate() {
+                let parent = u32::try_from(depth.start + parent).map_err(|_| AppError::Internal)?;
+
+                for (subdirectory, name) in node.subdirectories().enumerate() {
+                    let child_key = if dir_key.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{dir_key}/{name}")
+                    };
+
+                    // A name a request could not spell (a separator inside it
+                    // on unix, a ':' on Windows) has no key of its own to list
+                    // it by.
+                    if path::normalize(&child_key).ok().as_deref() == Some(child_key.as_str()) {
+                        let subdirectory =
+                            u32::try_from(subdirectory).map_err(|_| AppError::Internal)?;
+                        children.push((parent, subdirectory, child_key));
+                    }
+                }
+            }
+
+            depth = levels.len()..levels.len();
+
+            let mut pending = children.as_slice();
+
+            while !pending.is_empty() {
+                // Each listing costs at least one, so no more than `remaining`
+                // of them can fit.
+                if remaining == 0 {
+                    break 'walk;
+                }
+
+                let size = pending.len().min(SUBTREE_BATCH).min(remaining);
+                let (batch, rest) = pending.split_at(size);
+                pending = rest;
+
+                let found =
+                    join_all(batch.iter().map(|(_, _, child_key)| self.subtree_child(child_key)))
+                        .await;
+
+                for ((parent, subdirectory, child_key), found) in batch.iter().zip(found) {
+                    let Some((child, child_origin)) = found else {
+                        continue;
+                    };
+
+                    let Some(left) = remaining.checked_sub(child.entries() + 1) else {
+                        break 'walk;
+                    };
+
+                    remaining = left;
+                    origin = origin.and(child_origin);
+
+                    descendants.push((*parent, *subdirectory, Arc::clone(&child)));
+                    levels.push((child_key.clone(), child));
+                    depth.end += 1;
+                }
+            }
+        }
+
+        Ok((flat::subtree(&levels[0].1, &descendants), origin, freshness))
+    }
+
+    /// One subdirectory's node for a subtree answer, or `None` if it cannot be
+    /// resolved or listed, or the feed cannot vouch for it.
+    async fn subtree_child(&self, key: &str) -> Option<(Arc<DirNode>, Origin)> {
+        let _permit = self.subtree_lookups.acquire().await.ok()?;
+        let (canonical, resolved, named) = self.resolve(key).await.ok()?;
+        let (node, scanned, listed) = self.dir_node(&canonical).await.ok()?;
+
+        (named.and(listed) == Freshness::Vouched).then(|| (node, resolved.and(scanned)))
     }
 
     /// Serialised metadata for a single entry.

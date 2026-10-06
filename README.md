@@ -29,4 +29,8 @@ cargo run --release -- <directory to serve>    # listens on $PORT (default 8080)
 
 A metadata answer the feed cannot vouch for is marked `Cache-Control: no-store`. That covers a load that a batch of changes overtook, and any path that resolved through a symlink, since the watcher reports the target's path and not the one the client asked by. `src/utils/feed.rs` states the contract in full.
 
+## Subtree listings
+
+`GET /get_dir_info?path=P&subtree=N` answers with `P`'s listing plus, in its `descendants`, the listings of the directories beneath it, breadth first, until the next one would take the answer past `N` entries; `P`'s listing counts its entries and each one beneath it its entries plus one, and `N` is capped at 65536. A listing the change feed cannot vouch for is left out, with everything beneath it, so that the rest of the answer can still be cached. A descendant names its directory by position: the `subdirectory`-th entry of listing `parent`, where 0 is `P` itself. Without `subtree` the answer is the plain listing, as before.
+
 Performance measurements are described in [BENCHMARKING.md](BENCHMARKING.md).
