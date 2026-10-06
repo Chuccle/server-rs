@@ -1033,9 +1033,21 @@ fn load_content(path: &Path, limit: u64) -> Result<Content, AppError> {
         .map(httpdate::fmt_http_date)
         .and_then(|date| axum::http::HeaderValue::from_str(&date).ok());
 
-    // Strong validator over the two things that change when the bytes do.
-    let ticks = RawMeta::from_std(&metadata).modified;
-    let etag = axum::http::HeaderValue::from_str(&format!("\"{len:x}-{ticks:x}\"")).ok();
+    // Strong validator over the two things that change when the bytes do,
+    // spelled the way the streaming file service spells its own, so a file
+    // carries one tag whichever way it is served and a client can check a
+    // range against the size and time a listing gave it. tower-http documents
+    // its spelling as an implementation detail, so
+    // `a_file_carries_one_entity_tag_resident_or_streamed` pins it, and the
+    // driver's `HttpParseFileVersion` parses it.
+    let etag = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| {
+            let (seconds, nanos) = (since.as_secs(), since.subsec_nanos());
+            axum::http::HeaderValue::from_str(&format!("\"{seconds:x}.{nanos:08x}-{len:x}\"")).ok()
+        });
 
     Ok(Content::Resident(Arc::new(FileNode {
         data: Bytes::from(data),
