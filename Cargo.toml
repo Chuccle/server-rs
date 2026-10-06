@@ -59,6 +59,9 @@ tokio = { version = "1.52.3", features = [
 notify-debouncer-full = "0.7.0"
 tower-http = { version = "0.7.0", features = ["fs"] }
 moka = {  version = "0.12.15", features = ["future"] }
+# Already in the tree via axum/hyper; subtree listings look up a batch of
+# directories at once.
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 percent-encoding = "2.3.2"
 
 [dev-dependencies]
