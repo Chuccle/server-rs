@@ -142,6 +142,47 @@ pub fn resolve_blocking(base: &Path, key: &str) -> Result<PathBuf, AppError> {
     }
 }
 
+/// The request key that names `path`.
+///
+/// Relative to `base`, segments joined by `/`, the empty string for `base`
+/// itself. `None` if `path` is not under `base` or a segment is not UTF-8,
+/// since no request could spell it.
+pub fn key_of(base: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(base).ok()?;
+    let mut key = String::with_capacity(relative.as_os_str().len());
+
+    for segment in relative.components() {
+        let std::path::Component::Normal(segment) = segment else {
+            return None;
+        };
+
+        if !key.is_empty() {
+            key.push('/');
+        }
+
+        key.push_str(segment.to_str()?);
+    }
+
+    Some(key)
+}
+
+/// Whether `canonical` is `key` spelled under `base`.
+///
+/// False when resolving went through a symlink. On Windows, where the
+/// filesystem is case-insensitive and canonicalisation restores the on-disk
+/// case, a key that differs only by ASCII case still spells it; a non-ASCII
+/// case difference counts as an alias, which only costs the client a cache
+/// entry.
+pub fn spells(base: &Path, canonical: &Path, key: &str) -> bool {
+    key_of(base, canonical).is_some_and(|spelled| {
+        if cfg!(windows) {
+            spelled.eq_ignore_ascii_case(key)
+        } else {
+            spelled == key
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
