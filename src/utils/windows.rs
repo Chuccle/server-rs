@@ -17,4 +17,16 @@ pub mod time {
                 + WINDOWS_EPOCH_OFFSET
         }
     }
+
+    /// The time `ticks` names, or `None` for zero, which a client sends for a
+    /// time it leaves alone, and for anything before 1970.
+    pub fn from_file_time(ticks: u64) -> Option<std::time::SystemTime> {
+        let since = ticks.checked_sub(WINDOWS_EPOCH_OFFSET)?;
+
+        (ticks != 0).then(|| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(since / 10_000_000)
+                + std::time::Duration::from_nanos((since % 10_000_000) * 100)
+        })
+    }
 }

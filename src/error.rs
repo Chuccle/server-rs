@@ -18,6 +18,10 @@ pub enum AppError {
     BadRequest,
     #[error("Change feed is not running")]
     FeedUnavailable,
+    #[error("The name is taken, or the directory is not empty")]
+    Conflict,
+    #[error("The entry is no longer the version the request names")]
+    PreconditionFailed,
 }
 
 impl From<std::io::Error> for AppError {
@@ -25,6 +29,9 @@ impl From<std::io::Error> for AppError {
         match error.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Self::NotFound,
             std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty => {
+                Self::Conflict
+            }
             _ => Self::Internal,
         }
     }
@@ -54,6 +61,8 @@ impl axum::response::IntoResponse for AppError {
             Self::Internal => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest => axum::http::StatusCode::BAD_REQUEST,
             Self::FeedUnavailable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::Conflict => axum::http::StatusCode::CONFLICT,
+            Self::PreconditionFailed => axum::http::StatusCode::PRECONDITION_FAILED,
         };
 
         axum::response::IntoResponse::into_response(status)
