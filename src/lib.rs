@@ -348,7 +348,7 @@ pub fn resolve_base_path(argument: &str) -> std::path::PathBuf {
 /// the feed would go on vouching for a tree nobody is watching.
 pub fn start_fs_watcher(path: std::path::PathBuf, state: std::sync::Arc<AppState>) {
     tokio::spawn(async move {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
 
         let watching = notify_debouncer_full::new_debouncer(
             tokio::time::Duration::from_secs(2),
@@ -383,20 +383,29 @@ pub fn start_fs_watcher(path: std::path::PathBuf, state: std::sync::Arc<AppState
             state.store.go_live();
         }
 
-        while let Some(res) = rx.recv().await {
-            match res {
-                Ok(events) => utils::cache::handle_fs_events(&events, &state.store).await,
-                Err(errors) => {
-                    for e in errors {
-                        log_error_with_context!(e, "watch receive error; the change feed stops");
-                    }
+        receive_fs_events(rx, &state).await;
+    });
+}
 
-                    state.store.invalidate_all();
-                    state.store.feed().fail();
+// Keep the receive loop shared with error-injection tests: calling Feed::fail
+// directly would not catch stale cache entries after events were lost.
+async fn receive_fs_events(
+    mut rx: tokio::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+    state: &AppState,
+) {
+    while let Some(res) = rx.recv().await {
+        match res {
+            Ok(events) => utils::cache::handle_fs_events(&events, &state.store).await,
+            Err(errors) => {
+                for e in errors {
+                    log_error_with_context!(e, "watch receive error; the change feed stops");
                 }
+
+                state.store.invalidate_all();
+                state.store.feed().fail();
             }
         }
-    });
+    }
 }
 
 #[cfg(feature = "stats")]
@@ -3546,19 +3555,78 @@ mod tests {
             let epoch = state.store.feed().epoch();
 
             let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-            let events = [DebouncedEvent::new(rescan, std::time::Instant::now())];
-            utils::cache::handle_fs_events(&events, &state.store).await;
+            let events = vec![DebouncedEvent::new(rescan, std::time::Instant::now())];
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(Ok(events)).await.unwrap();
+            drop(tx);
+            receive_fs_events(rx, &state).await;
 
             let batch = poll(&state, epoch, 0).await;
             assert!(batch.reset);
             assert_eq!(batch.generation, 1);
         }
 
+        // Send through the production receiver after warming all tiers. A feed
+        // failure alone says nothing about the HTTP bytes still served from cache.
         #[tokio::test]
-        async fn a_watcher_failure_stops_the_feed() {
-            let (_temp, state) = live(utils::cache::Config::default());
+        async fn a_watcher_failure_drops_cached_answers_and_stops_the_feed() {
+            let (temp, state) = live(utils::cache::Config::default());
+            let file_uri = "/get_file?path=test_dir/file_in_dir.txt";
+            let listing_uri = "/get_dir_info?path=test_dir";
+            let metadata_uri = "/get_dir_entry_info?path=test_dir/file_in_dir.txt";
 
-            state.store.feed().fail();
+            for uri in [file_uri, listing_uri, metadata_uri] {
+                let response = get(&state, uri).await;
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let _ = response.collect().await.unwrap();
+            }
+            assert!(
+                state
+                    .store
+                    .has_content(&canonical(&state, "test_dir/file_in_dir.txt"))
+            );
+            assert!(state.store.has_directory(&canonical(&state, "test_dir")));
+
+            fs::rename(temp.path().join("test_dir"), temp.path().join("old_dir")).unwrap();
+            fs::create_dir(temp.path().join("test_dir")).unwrap();
+            fs::write(temp.path().join("test_dir/file_in_dir.txt"), b"replacement").unwrap();
+            fs::write(temp.path().join("test_dir/new.txt"), b"new").unwrap();
+
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(Err(vec![notify_debouncer_full::notify::Error::generic(
+                "lost events",
+            )]))
+            .await
+            .unwrap();
+            drop(tx);
+            receive_fs_events(rx, &state).await;
+
+            let response = get(&state, file_uri).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(response.collect().await.unwrap().to_bytes(), "replacement");
+
+            let response = get(&state, listing_uri).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let bytes = response.collect().await.unwrap().to_bytes();
+            let listing = flatbuffers::root::<Directory>(&bytes).unwrap();
+            let mut names: Vec<_> = listing
+                .files()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.name().unwrap())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, ["file_in_dir.txt", "new.txt"]);
+
+            let response = get(&state, metadata_uri).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let bytes = response.collect().await.unwrap().to_bytes();
+            assert_eq!(
+                flatbuffers::root::<DirectoryEntryMetadata>(&bytes)
+                    .unwrap()
+                    .size(),
+                11
+            );
 
             let response = get(&state, "/get_changes").await;
             assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
