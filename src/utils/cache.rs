@@ -1219,6 +1219,24 @@ mod tests {
         );
     }
 
+    // The entry appeared after its parent was cached. A successful direct
+    // stat must encode current metadata without treating an old listing as authoritative.
+    #[tokio::test]
+    async fn direct_metadata_fallback_finds_an_entry_missing_from_cached_parent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        let store = Store::new(root.path(), Config::default()).unwrap();
+        store.directory_listing("dir").await.unwrap();
+        std::fs::write(root.path().join("dir/new.txt"), b"new bytes").unwrap();
+        let (bytes, origin, _) = store.entry_metadata("dir/new.txt").await.unwrap();
+        assert_eq!(origin, Origin::Filesystem);
+        let entry =
+            flatbuffers::root::<crate::generated::blorg_meta_flat::DirectoryEntryMetadata>(&bytes)
+                .unwrap();
+        assert_eq!(entry.size(), 9);
+        assert!(!entry.directory());
+    }
+
     /// Build a directory and scan it, so the index under test is the one the
     /// server would actually hold.
     fn scanned(names: &[&str], dirs: &[&str]) -> (tempfile::TempDir, DirNode) {

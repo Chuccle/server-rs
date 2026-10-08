@@ -603,48 +603,219 @@ mod tests {
 
     // Pin the streaming contract independently of resident response assembly:
     // its preconditions and malformed/multipart range behavior differ.
-    #[tokio::test]
-    async fn confined_streams_keep_conditional_range_and_head_contracts() {
+    fn conditional_file_app(max_resident_file_bytes: u64) -> (tempfile::TempDir, Router) {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("file #%.txt"), b"abcdefghij").unwrap();
-        let file = File::options().write(true).open(root.path().join("file #%.txt")).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_modified(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))).unwrap();
-        let state = Arc::new(AppState::new(root.path(), utils::cache::Config {
-            max_resident_file_bytes: 0,
-            ..utils::cache::Config::default()
-        }).unwrap());
-        let app = build_router(state);
-        let request = || Request::builder().uri("/get_file?path=file%20%23%25.txt");
-        let response = app.clone().oneshot(request().body(Body::empty()).unwrap()).await.unwrap();
+        File::options()
+            .write(true)
+            .open(root.path().join("file #%.txt"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+            ))
+            .unwrap();
+        let app = build_router(Arc::new(
+            AppState::new(
+                root.path(),
+                utils::cache::Config {
+                    max_resident_file_bytes,
+                    ..utils::cache::Config::default()
+                },
+            )
+            .unwrap(),
+        ));
+        (root, app)
+    }
+
+    async fn file_response(
+        app: &Router,
+        method: http::Method,
+        headers: &[(http::header::HeaderName, String)],
+    ) -> http::Response<Body> {
+        let mut request = Request::builder()
+            .uri("/get_file?path=file%20%23%25.txt")
+            .method(method);
+        for (name, value) in headers {
+            request = request.header(name.clone(), value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn confined_streams_keep_conditional_range_and_head_contracts() {
+        let (_root, app) = conditional_file_app(0);
+        let response = file_response(&app, http::Method::GET, &[]).await;
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(response.headers()[http::header::CONTENT_TYPE], "text/plain");
-        let etag = response.headers()[http::header::ETAG].to_str().unwrap().to_owned();
+        let etag = response.headers()[http::header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
         for (name, value, status) in [
             (http::header::IF_MATCH, etag.clone(), http::StatusCode::OK),
-            (http::header::IF_MATCH, "\"other\"".to_owned(), http::StatusCode::PRECONDITION_FAILED),
-            (http::header::IF_NONE_MATCH, format!("\"other\", W/{etag}"), http::StatusCode::NOT_MODIFIED),
-            (http::header::IF_UNMODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT".to_owned(), http::StatusCode::PRECONDITION_FAILED),
-            (http::header::IF_MODIFIED_SINCE, "Mon, 21 Oct 2030 07:28:00 GMT".to_owned(), http::StatusCode::NOT_MODIFIED),
-            (http::header::RANGE, "bytes=20-30".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
-            (http::header::RANGE, "bytes=oops".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
-            (http::header::RANGE, "bytes=0-1,4-5".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
+            (
+                http::header::IF_MATCH,
+                "\"other\"".to_owned(),
+                http::StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                http::header::IF_NONE_MATCH,
+                format!("\"other\", W/{etag}"),
+                http::StatusCode::NOT_MODIFIED,
+            ),
+            (
+                http::header::IF_UNMODIFIED_SINCE,
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_owned(),
+                http::StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                http::header::IF_MODIFIED_SINCE,
+                "Mon, 21 Oct 2030 07:28:00 GMT".to_owned(),
+                http::StatusCode::NOT_MODIFIED,
+            ),
+            (
+                http::header::RANGE,
+                "bytes=20-30".to_owned(),
+                http::StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            (
+                http::header::RANGE,
+                "bytes=oops".to_owned(),
+                http::StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            (
+                http::header::RANGE,
+                "bytes=0-1,4-5".to_owned(),
+                http::StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
         ] {
-            let response = app.clone().oneshot(request().header(name, value)
-                .body(Body::empty()).unwrap()).await.unwrap();
+            let response = file_response(&app, http::Method::GET, &[(name, value)]).await;
             assert_eq!(response.status(), status);
             response.into_body().collect().await.unwrap();
         }
         for method in [http::Method::GET, http::Method::HEAD] {
-            let response = app.clone().oneshot(request().method(method.clone())
-                .header(http::header::RANGE, "bytes=2-4")
-                .body(Body::empty()).unwrap()).await.unwrap();
+            let response = file_response(
+                &app,
+                method.clone(),
+                &[(http::header::RANGE, "bytes=2-4".to_owned())],
+            )
+            .await;
             assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
-            assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes 2-4/10");
+            assert_eq!(
+                response.headers()[http::header::CONTENT_RANGE],
+                "bytes 2-4/10"
+            );
             assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "3");
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let expected: &[u8] = if method == http::Method::HEAD { b"" } else { b"cde" };
+            let expected: &[u8] = if method == http::Method::HEAD {
+                b""
+            } else {
+                b"cde"
+            };
             assert_eq!(bytes.as_ref(), expected);
+        }
+    }
+
+    // Resident responses use a different range/validator implementation from
+    // tower's streamed service. Exercise both headers and bytes through the router.
+    #[tokio::test]
+    async fn resident_responses_obey_validators_ranges_and_head() {
+        let (_root, app) = conditional_file_app(1024);
+        let response = file_response(&app, http::Method::GET, &[]).await;
+        let etag = response.headers()[http::header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "abcdefghij"
+        );
+        for (name, value) in [
+            (http::header::IF_NONE_MATCH, etag),
+            (http::header::IF_NONE_MATCH, "*".to_owned()),
+            (
+                http::header::IF_MODIFIED_SINCE,
+                "Mon, 21 Oct 2030 07:28:00 GMT".to_owned(),
+            ),
+        ] {
+            let response = file_response(
+                &app,
+                http::Method::GET,
+                &[(name, value), (http::header::RANGE, "bytes=2-4".to_owned())],
+            )
+            .await;
+            assert_eq!(response.status(), http::StatusCode::NOT_MODIFIED);
+            assert!(!response.headers().contains_key(http::header::CONTENT_RANGE));
+            assert!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+        let response = file_response(
+            &app,
+            http::Method::GET,
+            &[
+                (http::header::IF_NONE_MATCH, "\"other\"".to_owned()),
+                (
+                    http::header::IF_MODIFIED_SINCE,
+                    "Mon, 21 Oct 2030 07:28:00 GMT".to_owned(),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "abcdefghij"
+        );
+        let response = file_response(
+            &app,
+            http::Method::GET,
+            &[(http::header::RANGE, "bytes=20-30".to_owned())],
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes */10"
+        );
+        assert!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+        for method in [http::Method::GET, http::Method::HEAD] {
+            let response = file_response(
+                &app,
+                method.clone(),
+                &[(http::header::RANGE, "bytes=2-4".to_owned())],
+            )
+            .await;
+            assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers()[http::header::CONTENT_RANGE],
+                "bytes 2-4/10"
+            );
+            assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "3");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let expected: &[u8] = if method == http::Method::HEAD {
+                b""
+            } else {
+                b"cde"
+            };
+            assert_eq!(body.as_ref(), expected);
         }
     }
 
@@ -662,11 +833,22 @@ mod tests {
         let file = state.store.open_file(&path).await.unwrap();
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(outside.path().join("file.txt"), &path).unwrap();
-        let response = utils::http::streamed_response(file, &path, Request::builder()
-            .uri("/get_file?path=file.txt").body(Body::empty()).unwrap()).await.unwrap();
+        let response = utils::http::streamed_response(
+            file,
+            &path,
+            Request::builder()
+                .uri("/get_file?path=file.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "6");
-        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "inside");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "inside"
+        );
     }
 
     mod extract_path {
@@ -2879,10 +3061,23 @@ mod tests {
             let sub_dir = primed(&state, "test_dir").await;
             let nested = primed(&state, "test_dir/nested_test_dir").await;
 
-            let events = [event(
-                EventKind::Remove(RemoveKind::Folder),
-                &[&sub_dir],
-            )];
+            let files = [
+                "test_dir/file_in_dir.txt",
+                "test_dir/nested_test_dir/file_in_nested_test_dir.txt",
+            ];
+            let mut cached_paths = Vec::new();
+            for file in files {
+                let (path, _, _, _) = state.store.file_content(file).await.unwrap();
+                assert!(state.store.has_content(&path));
+                cached_paths.push(path);
+            }
+            fs::rename(temp.path().join("test_dir"), temp.path().join("old_dir")).unwrap();
+            fs::create_dir_all(temp.path().join("test_dir/nested_test_dir")).unwrap();
+            for file in files {
+                fs::write(temp.path().join(file), b"replacement bytes").unwrap();
+            }
+
+            let events = [event(EventKind::Remove(RemoveKind::Folder), &[&sub_dir])];
 
             utils::cache::handle_fs_events(&events, &state.store).await;
 
@@ -2895,6 +3090,25 @@ mod tests {
                 !state.store.has_directory(&nested),
                 "a descendant of the removed directory must not survive as a stale entry"
             );
+            let app = crate::build_router(Arc::clone(&state));
+            for (file, path) in files.into_iter().zip(cached_paths) {
+                assert!(!state.store.has_content(&path));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/get_file?path={file}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), http::StatusCode::OK);
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    "replacement bytes"
+                );
+            }
         }
 
         #[tokio::test]
