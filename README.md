@@ -23,6 +23,14 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo run --release -- <directory to serve>    # listens on $PORT (default 8080)
 ```
 
+Filesystem accesses use an opened export-root capability, including streams
+and metadata cache misses. A cached resolution cannot authorise access outside
+that root after an ancestor is replaced. Streaming headers and bytes use the
+same opened file. Absolute symlinks to in-root targets remain supported.
+On Windows, the root directory handle prevents renaming or deleting that root
+while the server is running; transient scan handles can also prevent directory
+renames. Windows sharing behaviour still needs a native runtime check.
+
 ## Change feed
 
 `GET /get_changes?epoch=E&since=G` reports every path the filesystem watcher saw change after generation `G`, as a `ChangeBatch`, and holds the request for up to 20 s while nothing has. A client that follows it can keep metadata until it is told the path changed, instead of expiring it on a timer. Each path appears once: under `created` or `removed` if whether it exists changed, so a rename reports both of its paths, and otherwise under `modified`. A batch with `reset` set means the client must drop everything: the server restarted, or the client fell further behind than the server retains. The route answers 503 while the watcher is not running, after it reported an error, and always on Windows, where the watcher can lose events without reporting it, because a feed that may have missed events cannot promise that nothing changed.

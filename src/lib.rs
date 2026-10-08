@@ -209,14 +209,11 @@ pub async fn get_file_handler(
             utils::http::resident_response(&node, request.method(), request.headers())
         }
 
-        // Too large to hold resident, so hand it to the streaming file service.
+        // Open beneath the export root and stream that same handle. Reopening
+        // a cached canonical pathname here would reintroduce traversal races.
         utils::cache::Content::Streamed => {
-            use axum::response::IntoResponse as _;
-
-            tower_http::services::ServeFile::new(&canonical)
-                .try_call(request)
-                .await?
-                .into_response()
+            let file = data.store.open_file(&canonical).await?;
+            utils::http::streamed_response(file, &canonical, request).await?
         }
     };
 
@@ -448,6 +445,229 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use tower::{Service, util::ServiceExt};
+
+    // Warm resolution must never authorise a later open through a replaced
+    // ancestor. Exercise the router and collect the body: checking only a
+    // canonicalisation helper would miss ServeFile's second pathname open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_streamed_paths_cannot_escape_through_a_replaced_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/file.txt"), b"inside").unwrap();
+        fs::write(outside.path().join("file.txt"), b"outside secret").unwrap();
+        let state = Arc::new(
+            AppState::new(
+                root.path(),
+                utils::cache::Config {
+                    max_resident_file_bytes: 0,
+                    ..utils::cache::Config::default()
+                },
+            )
+            .unwrap(),
+        );
+        let app = build_router(state);
+        let warm = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/get_file?path=dir/file.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), http::StatusCode::OK);
+        assert_eq!(
+            warm.into_body().collect().await.unwrap().to_bytes(),
+            "inside"
+        );
+        fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        for method in [http::Method::GET, http::Method::HEAD] {
+            for path in [
+                "dir/file.txt",
+                "dir%2Ffile.txt",
+                "dir/./file.txt",
+                "dir%5Cfile.txt",
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(format!("/get_file?path={path}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::FORBIDDEN,
+                    "{method} {path}"
+                );
+                assert!(!response.headers().contains_key(http::header::ETAG));
+                assert!(!response.headers().contains_key(http::header::LAST_MODIFIED));
+            }
+        }
+    }
+
+    // Metadata can warm a resolution without loading content or the child's
+    // own listing. Both subsequent cache loaders must use the root boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_metadata_paths_confine_resident_and_directory_loaders() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("dir/sub")).unwrap();
+        fs::create_dir(outside.path().join("sub")).unwrap();
+        fs::write(root.path().join("dir/file.txt"), b"inside").unwrap();
+        fs::write(outside.path().join("file.txt"), b"outside secret").unwrap();
+        fs::write(outside.path().join("sub/secret.txt"), b"secret").unwrap();
+        let state = Arc::new(AppState::new(root.path(), utils::cache::Config::default()).unwrap());
+        let app = build_router(state);
+        for path in ["dir/file.txt", "dir/sub"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/get_dir_entry_info?path={path}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+        }
+        fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        for uri in [
+            "/get_file?path=dir/file.txt",
+            "/get_dir_info?path=dir/sub",
+            "/get_dir_info?path=dir/sub&subtree=64",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    // Rejection must be about leaving the export namespace. A cached name
+    // replaced with a symlink to another in-root directory remains usable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_streamed_paths_accept_in_root_ancestor_replacements() {
+        for absolute in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("dir")).unwrap();
+            fs::write(root.path().join("dir/file.txt"), b"inside").unwrap();
+            let state = Arc::new(
+                AppState::new(
+                    root.path(),
+                    utils::cache::Config {
+                        max_resident_file_bytes: 0,
+                        ..utils::cache::Config::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let app = build_router(state);
+            let request = || {
+                Request::builder()
+                    .uri("/get_file?path=dir/file.txt")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let response = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            fs::rename(root.path().join("dir"), root.path().join("moved")).unwrap();
+            let target = if absolute {
+                root.path().join("moved")
+            } else {
+                "moved".into()
+            };
+            std::os::unix::fs::symlink(target, root.path().join("dir")).unwrap();
+            let response = app.oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "inside"
+            );
+        }
+    }
+
+    // Pin the streaming contract independently of resident response assembly:
+    // its preconditions and malformed/multipart range behavior differ.
+    #[tokio::test]
+    async fn confined_streams_keep_conditional_range_and_head_contracts() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file #%.txt"), b"abcdefghij").unwrap();
+        let file = File::options().write(true).open(root.path().join("file #%.txt")).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))).unwrap();
+        let state = Arc::new(AppState::new(root.path(), utils::cache::Config {
+            max_resident_file_bytes: 0,
+            ..utils::cache::Config::default()
+        }).unwrap());
+        let app = build_router(state);
+        let request = || Request::builder().uri("/get_file?path=file%20%23%25.txt");
+        let response = app.clone().oneshot(request().body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "text/plain");
+        let etag = response.headers()[http::header::ETAG].to_str().unwrap().to_owned();
+        for (name, value, status) in [
+            (http::header::IF_MATCH, etag.clone(), http::StatusCode::OK),
+            (http::header::IF_MATCH, "\"other\"".to_owned(), http::StatusCode::PRECONDITION_FAILED),
+            (http::header::IF_NONE_MATCH, format!("\"other\", W/{etag}"), http::StatusCode::NOT_MODIFIED),
+            (http::header::IF_UNMODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT".to_owned(), http::StatusCode::PRECONDITION_FAILED),
+            (http::header::IF_MODIFIED_SINCE, "Mon, 21 Oct 2030 07:28:00 GMT".to_owned(), http::StatusCode::NOT_MODIFIED),
+            (http::header::RANGE, "bytes=20-30".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
+            (http::header::RANGE, "bytes=oops".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
+            (http::header::RANGE, "bytes=0-1,4-5".to_owned(), http::StatusCode::RANGE_NOT_SATISFIABLE),
+        ] {
+            let response = app.clone().oneshot(request().header(name, value)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), status);
+            response.into_body().collect().await.unwrap();
+        }
+        for method in [http::Method::GET, http::Method::HEAD] {
+            let response = app.clone().oneshot(request().method(method.clone())
+                .header(http::header::RANGE, "bytes=2-4")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes 2-4/10");
+            assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "3");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let expected: &[u8] = if method == http::Method::HEAD { b"" } else { b"cde" };
+            assert_eq!(bytes.as_ref(), expected);
+        }
+    }
+
+    // Once the router has confined its open, changing the pathname must not
+    // redirect the streaming service. The response must consume that handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_uses_the_confined_handle_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        fs::write(&path, b"inside").unwrap();
+        fs::write(outside.path().join("file.txt"), b"outside secret").unwrap();
+        let state = AppState::new(root.path(), utils::cache::Config::default()).unwrap();
+        let file = state.store.open_file(&path).await.unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file.txt"), &path).unwrap();
+        let response = utils::http::streamed_response(file, &path, Request::builder()
+            .uri("/get_file?path=file.txt").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "6");
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "inside");
+    }
 
     mod extract_path {
         use super::*;

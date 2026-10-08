@@ -172,14 +172,14 @@ const MIN_CHUNK: usize = 128;
 /// Plain threads rather than a `rayon`/tokio dependency: this runs once per
 /// cache miss, already inside `spawn_blocking`, and needs nothing beyond
 /// "run N closures, join them" - not a dependency's work-stealing scheduler.
-fn stat_children(entries: &[std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
-    fn stat_one(entry: &std::fs::DirEntry) -> Option<(Box<str>, RawMeta)> {
+fn stat_children(entries: &[cap_std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
+    fn stat_one(entry: &cap_std::fs::DirEntry) -> Option<(Box<str>, RawMeta)> {
         // The schema carries UTF-8 names, and a non-UTF-8 name could not be
         // addressed through a query string either.
         let name = entry.file_name().into_string().ok()?;
         let metadata = entry.metadata().ok()?;
 
-        Some((name.into_boxed_str(), RawMeta::from_std(&metadata)))
+        Some((name.into_boxed_str(), RawMeta::from_cap(&metadata)))
     }
 
     // Below the threshold, stay on a single pass with no further syscalls:
@@ -209,7 +209,11 @@ fn stat_children(entries: &[std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
             // A worker can only fail by panicking, which already unwinds the
             // process in a `spawn_blocking` context - nothing here downgrades
             // that into a silently dropped directory chunk.
-            .flat_map(|worker| worker.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            })
             .collect()
     })
 }
@@ -225,13 +229,23 @@ impl DirNode {
     /// [`AppError::NotFound`] if `path` is not a directory, plus the usual I/O
     /// mappings if it cannot be read.
     pub fn scan(path: &Path) -> Result<Self, AppError> {
-        let own_metadata = std::fs::metadata(path)?;
+        Self::scan_opened(&cap_std::fs::Dir::open_ambient_dir(
+            path,
+            cap_std::ambient_authority(),
+        )?)
+    }
+
+    /// Store loaders supply a directory opened beneath their export root.
+    /// Child metadata remains non-following, as with std's `DirEntry`.
+    fn scan_opened(directory: &cap_std::fs::Dir) -> Result<Self, AppError> {
+        let own_metadata = directory.dir_metadata()?;
 
         if !own_metadata.is_dir() {
             return Err(AppError::NotFound);
         }
 
-        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path)?
+        let entries: Vec<cap_std::fs::DirEntry> = directory
+            .entries()?
             .filter_map(std::result::Result::ok)
             .collect();
 
@@ -278,7 +292,7 @@ impl DirNode {
 
         Ok(Self {
             listing,
-            own: RawMeta::from_std(&own_metadata),
+            own: RawMeta::from_cap(&own_metadata),
             names: names.into_boxed_str(),
             offsets: offsets.into_boxed_slice(),
             metas: metas.into_boxed_slice(),
@@ -448,6 +462,7 @@ type KeyCache<V> = moka::future::Cache<String, Arc<Stamped<V>>, RandomState>;
 
 pub struct Store {
     base: PathBuf,
+    root: Arc<path::Root>,
     config: Config,
     resolved: KeyCache<Resolution>,
     dirs: PathCache<Arc<DirNode>>,
@@ -476,6 +491,7 @@ impl Store {
     /// this has to happen exactly once, here.
     pub fn new(base: &Path, config: Config) -> std::io::Result<Self> {
         let base = std::fs::canonicalize(base)?;
+        let root = Arc::new(path::Root::new(&base)?);
 
         let resolved = moka::future::Cache::builder()
             .max_capacity(config.metadata_bytes)
@@ -510,6 +526,7 @@ impl Store {
 
         Ok(Self {
             base,
+            root,
             config,
             resolved,
             dirs,
@@ -522,6 +539,12 @@ impl Store {
     #[inline]
     pub fn base(&self) -> &Path {
         &self.base
+    }
+
+    pub(crate) async fn open_file(&self, canonical: &Path) -> Result<std::fs::File, AppError> {
+        let root = Arc::clone(&self.root);
+        let canonical = canonical.to_path_buf();
+        Ok(tokio::task::spawn_blocking(move || root.open(&canonical)).await??)
     }
 
     #[inline]
@@ -726,10 +749,11 @@ impl Store {
         // parent. A stat is read after the request arrived, so it is as current
         // as the feed can promise anything to be.
         let target = canonical.to_path_buf();
-        let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(target)).await??;
+        let root = Arc::clone(&self.root);
+        let metadata = tokio::task::spawn_blocking(move || root.metadata(&target)).await??;
 
         Ok((
-            flat::entry(&RawMeta::from_std(&metadata)),
+            flat::entry(&RawMeta::from_cap(&metadata)),
             Origin::Filesystem,
             named,
         ))
@@ -752,6 +776,7 @@ impl Store {
         } else {
             let cache_key = canonical.to_path_buf();
             let load_path = cache_key.clone();
+            let root = Arc::clone(&self.root);
             let limit = self.config.max_resident_file_bytes;
             let generation = self.feed.current();
 
@@ -759,7 +784,7 @@ impl Store {
                 .contents
                 .try_get_with(cache_key, async move {
                     let content =
-                        tokio::task::spawn_blocking(move || load_content(&load_path, limit))
+                        tokio::task::spawn_blocking(move || load_content(&root, &load_path, limit))
                             .await
                             .map_err(AppError::from)??;
 
@@ -787,8 +812,8 @@ impl Store {
     /// Request key to canonical path, coalescing concurrent cold lookups so a
     /// thundering herd costs one `canonicalize` rather than one each.
     ///
-    /// Only successes are cached, which keeps an "allowed" verdict from
-    /// outliving the symlink topology that justified it.
+    /// Only successes are cached. Cached names are hints: every later
+    /// filesystem access still goes through the opened export root.
     async fn resolve(&self, key: &str) -> Result<(Arc<Path>, Origin, Freshness), AppError> {
         let (entry, origin) = if let Some(entry) = self.resolved.get(key).await {
             (entry, Origin::Cache)
@@ -839,13 +864,16 @@ impl Store {
         } else {
             let cache_key = canonical.to_path_buf();
             let scan_path = cache_key.clone();
+            let root = Arc::clone(&self.root);
             let generation = self.feed.current();
 
             let entry = self
                 .dirs
                 .try_get_with(cache_key, async move {
-                    let node =
-                        tokio::task::spawn_blocking(move || DirNode::scan(&scan_path)).await??;
+                    let node = tokio::task::spawn_blocking(move || {
+                        DirNode::scan_opened(&root.open_dir(&scan_path)?)
+                    })
+                    .await??;
 
                     Ok::<_, AppError>(Stamped::new(Arc::new(node), generation))
                 })
@@ -1003,10 +1031,10 @@ impl Store {
 /// file resident. Reading metadata off the open handle rather than the path
 /// saves a syscall and closes the window where the path could change underneath
 /// us.
-fn load_content(path: &Path, limit: u64) -> Result<Content, AppError> {
+fn load_content(root: &path::Root, path: &Path, limit: u64) -> Result<Content, AppError> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = root.open(path)?;
     let metadata = file.metadata()?;
 
     if metadata.is_dir() {
@@ -1169,6 +1197,27 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Make the parent listing miss while preserving warm resolution. This
+    // forces the real direct-stat fallback rather than serving safe old bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_metadata_fallback_cannot_escape_a_warm_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file"), b"inside").unwrap();
+        std::fs::write(outside.path().join("file"), b"outside secret").unwrap();
+        let store = Store::new(root.path(), Config::default()).unwrap();
+        store.entry_metadata("dir/file").await.unwrap();
+        std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        store.dirs.invalidate_all();
+        assert_eq!(
+            store.entry_metadata("dir/file").await.unwrap_err(),
+            AppError::PermissionDenied
+        );
+    }
 
     /// Build a directory and scan it, so the index under test is the one the
     /// server would actually hold.
