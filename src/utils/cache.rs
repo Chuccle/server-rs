@@ -209,11 +209,7 @@ fn stat_children(entries: &[cap_std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> 
             // A worker can only fail by panicking, which already unwinds the
             // process in a `spawn_blocking` context - nothing here downgrades
             // that into a silently dropped directory chunk.
-            .flat_map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
-            })
+            .flat_map(|worker| worker.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
             .collect()
     })
 }
