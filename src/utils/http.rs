@@ -1,6 +1,6 @@
-//! Response assembly for files held resident in memory.
+//! Response assembly for resident files and capability-opened streams.
 //!
-//! Everything here is pure: the headers were rendered when the file was loaded
+//! Resident responses are pure: the headers were rendered when the file was loaded
 //! and the body is a slice of an already-owned buffer, so answering a request -
 //! including a ranged or conditional one - costs no syscalls and no copies.
 //!
@@ -11,6 +11,102 @@ use crate::utils::cache::FileNode;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+
+/// Keep tower-http's conditional requests, ranges, MIME type and HEAD
+/// behaviour while supplying the already confined file rather than a name
+/// it could reopen. Metadata and bytes come from this same open handle.
+pub(crate) async fn streamed_response(
+    file: std::fs::File,
+    path: &std::path::Path,
+    mut request: axum::http::Request<Body>,
+) -> std::io::Result<Response> {
+    let metadata = file.metadata()?;
+    if metadata.is_dir() {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let encoded = percent_encoding::utf8_percent_encode(&name, percent_encoding::NON_ALPHANUMERIC);
+    *request.uri_mut() = format!("/{encoded}")
+        .parse()
+        .map_err(std::io::Error::other)?;
+    let backend = OpenedBackend {
+        file: std::sync::Arc::new(file),
+        metadata,
+    };
+    Ok(tower_http::services::ServeDir::with_backend("", backend)
+        .append_index_html_on_directories(false)
+        .try_call(request)
+        .await?
+        .into_response())
+}
+
+/// A private single-file backend. The router has already selected and opened
+/// the file; service paths are used only to infer its MIME type.
+#[derive(Clone)]
+struct OpenedBackend {
+    file: std::sync::Arc<std::fs::File>,
+    metadata: std::fs::Metadata,
+}
+
+impl tower_http::services::fs::Backend for OpenedBackend {
+    type File = OpenedFile;
+    type Metadata = std::fs::Metadata;
+    type OpenFuture = std::future::Ready<std::io::Result<OpenedFile>>;
+    type MetadataFuture = std::future::Ready<std::io::Result<std::fs::Metadata>>;
+
+    fn open(&self, _: std::path::PathBuf) -> Self::OpenFuture {
+        std::future::ready(self.file.try_clone().map(|file| OpenedFile {
+            file: tokio::fs::File::from_std(file),
+            metadata: self.metadata.clone(),
+        }))
+    }
+
+    fn metadata(&self, _: std::path::PathBuf) -> Self::MetadataFuture {
+        std::future::ready(Ok(self.metadata.clone()))
+    }
+}
+
+struct OpenedFile {
+    file: tokio::fs::File,
+    metadata: std::fs::Metadata,
+}
+
+impl tokio::io::AsyncRead for OpenedFile {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.file).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncSeek for OpenedFile {
+    fn start_seek(
+        mut self: std::pin::Pin<&mut Self>,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<()> {
+        std::pin::Pin::new(&mut self.file).start_seek(position)
+    }
+
+    fn poll_complete(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        std::pin::Pin::new(&mut self.file).poll_complete(context)
+    }
+}
+
+impl tower_http::services::fs::File for OpenedFile {
+    type Metadata = std::fs::Metadata;
+    type MetadataFuture<'a> = std::future::Ready<std::io::Result<std::fs::Metadata>>;
+
+    fn metadata(&self) -> Self::MetadataFuture<'_> {
+        std::future::ready(Ok(self.metadata.clone()))
+    }
+}
 
 /// Build the response for a file we are holding in memory.
 ///
