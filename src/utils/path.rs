@@ -10,6 +10,70 @@ use crate::error::AppError;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+/// Filesystem access stays beneath this opened export root even when a cached
+/// pathname is renamed or replaced. Canonicalisation selects an in-root name;
+/// capability operations enforce the boundary at the actual access.
+pub(crate) struct Root {
+    base: PathBuf,
+    directory: cap_std::fs::Dir,
+}
+
+impl Root {
+    pub(crate) fn new(base: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            base: base.to_path_buf(),
+            directory: cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority())?,
+        })
+    }
+
+    fn relative<'a>(&self, path: &'a Path) -> std::io::Result<&'a Path> {
+        let relative = path
+            .strip_prefix(&self.base)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+        Ok(if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        })
+    }
+
+    /// cap-std rejects absolute symlinks. A warm name may now contain one
+    /// pointing inside the root, so retry once using its current canonical
+    /// spelling. The retry still accesses through the capability, never an
+    /// ambient open of the newly canonicalised pathname.
+    fn access<T>(
+        &self,
+        path: &Path,
+        operation: impl Fn(&Path) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let result = operation(self.relative(path)?);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            let canonical = std::fs::canonicalize(path)?;
+            return operation(self.relative(&canonical)?);
+        }
+        result
+    }
+
+    pub(crate) fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.access(path, |relative| {
+            self.directory
+                .open(relative)
+                .map(cap_std::fs::File::into_std)
+        })
+    }
+
+    pub(crate) fn open_dir(&self, path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+        self.access(path, |relative| self.directory.open_dir(relative))
+    }
+
+    pub(crate) fn metadata(&self, path: &Path) -> std::io::Result<cap_std::fs::Metadata> {
+        self.access(path, |relative| self.directory.metadata(relative))
+    }
+}
+
 /// Upper bound on path segments. Bounds the on-stack segment table and stops a
 /// pathological request from making the normaliser do unbounded work.
 const MAX_SEGMENTS: usize = 96;
@@ -114,10 +178,9 @@ fn check_segment(segment: &str) -> Result<(), AppError> {
 
 /// Turn a normalised key into an absolute path proven to live under `base`.
 ///
-/// `canonicalize` is the only thing that sees through symlinks, junctions,
-/// hardlinks and 8.3 aliases, so it remains the authority on containment. The
-/// point of the resolution cache is that this runs once per distinct request
-/// key rather than once per request.
+/// `canonicalize` resolves symlinks, junctions and 8.3 aliases to select an
+/// in-root spelling. Hardlinks do not redirect a pathname. Cached resolutions
+/// save this work; [`Root`] enforces containment again at each actual access.
 ///
 /// `base` must already be canonical; [`crate::utils::cache::Store::new`]
 /// guarantees it.

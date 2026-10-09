@@ -63,6 +63,7 @@ moka = {  version = "0.12.15", features = ["future"] }
 # directories at once.
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 percent-encoding = "2.3.2"
+cap-std = "4.0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

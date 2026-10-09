@@ -19,6 +19,17 @@ pub struct RawMeta {
 
 impl RawMeta {
     #[inline]
+    pub(crate) fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            size: metadata.len(),
+            created: file_time(metadata.created().map(cap_std::time::SystemTime::into_std)),
+            modified: file_time(metadata.modified().map(cap_std::time::SystemTime::into_std)),
+            accessed: file_time(metadata.accessed().map(cap_std::time::SystemTime::into_std)),
+            is_dir: metadata.is_dir(),
+        }
+    }
+
+    #[inline]
     pub fn from_std(metadata: &std::fs::Metadata) -> Self {
         Self {
             size: metadata.len(),
