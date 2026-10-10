@@ -67,6 +67,11 @@ futures-util = { version = "0.3.34", default-features = false, features = ["allo
 percent-encoding = "2.3.2"
 cap-std = "4.0.3"
 
+# Tells a symlink loop apart from other I/O errors; already in the tree via
+# tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 # Lists a directory through the handle opened beneath the export root, where
 # cap-std would rebuild a pathname from it and list that instead.
 [target.'cfg(windows)'.dependencies]

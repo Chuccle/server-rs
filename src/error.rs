@@ -20,15 +20,30 @@ pub enum AppError {
     FeedUnavailable,
 }
 
+/// A name the client sent that no file could have (too long, or holding a
+/// character Windows forbids) is the client's error, and a symlink loop names
+/// nothing; neither is the server failing.
 impl From<std::io::Error> for AppError {
     fn from(error: std::io::Error) -> Self {
+        if error.raw_os_error() == Some(SYMLINK_LOOP) {
+            return Self::NotFound;
+        }
+
         match error.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Self::NotFound,
             std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::InvalidFilename => Self::BadRequest,
             _ => Self::Internal,
         }
     }
 }
+
+/// `ErrorKind::FilesystemLoop` is unstable, so a loop is told by its code.
+#[cfg(unix)]
+const SYMLINK_LOOP: i32 = libc::ELOOP;
+
+#[cfg(windows)]
+const SYMLINK_LOOP: i32 = windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed();
 
 impl From<tokio::task::JoinError> for AppError {
     fn from(_: tokio::task::JoinError) -> Self {
