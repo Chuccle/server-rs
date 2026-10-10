@@ -27,8 +27,7 @@ impl Cache {
     pub fn record(&self, origin: crate::utils::cache::Origin) {
         match origin {
             crate::utils::cache::Origin::Cache => {
-                self.hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             crate::utils::cache::Origin::Filesystem => {
                 self.misses
