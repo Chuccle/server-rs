@@ -35,6 +35,11 @@ fn populated_dir(entries: usize) -> tempfile::TempDir {
     temp
 }
 
+/// The directory as the store hands it to a scan: opened, not named.
+fn open(path: &std::path::Path) -> cap_std::fs::Dir {
+    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()).expect("open")
+}
+
 /// Lexical normalisation runs on every single request, before anything else.
 fn bench_normalize(c: &mut Criterion) {
     let mut group = c.benchmark_group("path/normalize");
@@ -90,7 +95,7 @@ fn bench_child_lookup(c: &mut Criterion) {
 
     for entries in SIZES {
         let temp = populated_dir(entries);
-        let node = cache::DirNode::scan(temp.path()).expect("scan");
+        let node = cache::DirNode::scan(&open(temp.path())).expect("scan");
 
         // Middle of the range, so neither the first nor last probe is lucky.
         let hit = format!("entry_{:05}.dat", entries / 2);
@@ -144,7 +149,7 @@ fn bench_scan(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(u64::try_from(entries).expect("fits")));
         group.bench_with_input(BenchmarkId::from_parameter(entries), &entries, |b, _| {
-            b.iter(|| cache::DirNode::scan(black_box(temp.path())));
+            b.iter(|| cache::DirNode::scan(&open(black_box(temp.path()))));
         });
     }
 
