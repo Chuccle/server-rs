@@ -455,10 +455,25 @@ mod tests {
     use std::sync::Arc;
     use tower::{Service, util::ServiceExt};
 
+    /// A symlink to a directory, made as each platform makes one.
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    /// A symlink to a file, made as each platform makes one.
+    fn link_file(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
     // Warm resolution must never authorise a later open through a replaced
     // ancestor. Exercise the router and collect the body: checking only a
     // canonicalisation helper would miss ServeFile's second pathname open.
-    #[cfg(unix)]
     #[tokio::test]
     async fn warm_streamed_paths_cannot_escape_through_a_replaced_ancestor() {
         let root = tempfile::tempdir().unwrap();
@@ -493,7 +508,7 @@ mod tests {
             "inside"
         );
         fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        link_dir(outside.path(), &root.path().join("dir"));
         for method in [http::Method::GET, http::Method::HEAD] {
             for path in [
                 "dir/file.txt",
@@ -525,7 +540,6 @@ mod tests {
 
     // Metadata can warm a resolution without loading content or the child's
     // own listing. Both subsequent cache loaders must use the root boundary.
-    #[cfg(unix)]
     #[tokio::test]
     async fn warm_metadata_paths_confine_resident_and_directory_loaders() {
         let root = tempfile::tempdir().unwrap();
@@ -551,7 +565,7 @@ mod tests {
             assert_eq!(response.status(), http::StatusCode::OK);
         }
         fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        link_dir(outside.path(), &root.path().join("dir"));
         for uri in [
             "/get_file?path=dir/file.txt",
             "/get_dir_info?path=dir/sub",
@@ -568,7 +582,6 @@ mod tests {
 
     // Rejection must be about leaving the export namespace. A cached name
     // replaced with a symlink to another in-root directory remains usable.
-    #[cfg(unix)]
     #[tokio::test]
     async fn warm_streamed_paths_accept_in_root_ancestor_replacements() {
         for absolute in [false, true] {
@@ -594,13 +607,16 @@ mod tests {
             };
             let response = app.clone().oneshot(request()).await.unwrap();
             assert_eq!(response.status(), http::StatusCode::OK);
+            // Windows refuses to rename a directory while a file in it is
+            // open, and the streamed body holds the file until it is dropped.
+            drop(response);
             fs::rename(root.path().join("dir"), root.path().join("moved")).unwrap();
             let target = if absolute {
                 root.path().join("moved")
             } else {
                 "moved".into()
             };
-            std::os::unix::fs::symlink(target, root.path().join("dir")).unwrap();
+            link_dir(&target, &root.path().join("dir"));
             let response = app.oneshot(request()).await.unwrap();
             assert_eq!(response.status(), http::StatusCode::OK);
             assert_eq!(
@@ -610,8 +626,8 @@ mod tests {
         }
     }
 
-    // Streamed responses come from tower-http rather than resident response
-    // assembly, and differ on preconditions and malformed or multipart ranges.
+    // A file with fixed contents and modification time, held resident up to
+    // `max_resident_file_bytes` and streamed above it.
     fn conditional_file_app(max_resident_file_bytes: u64) -> (tempfile::TempDir, Router) {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("file #%.txt"), b"abcdefghij").unwrap();
@@ -728,8 +744,7 @@ mod tests {
         }
     }
 
-    // Resident responses use a different range/validator implementation from
-    // tower's streamed service. Exercise both headers and bytes through the router.
+    // Exercise a resident file's headers and bytes through the router.
     #[tokio::test]
     async fn resident_responses_obey_validators_ranges_and_head() {
         let (_root, app) = conditional_file_app(1024);
@@ -825,6 +840,39 @@ mod tests {
                 b"cde"
             };
             assert_eq!(body.as_ref(), expected);
+        }
+    }
+
+    // A client validates what it cached from a GET against a HEAD, so the two
+    // describe a file alike, whole or in part, resident or streamed.
+    #[tokio::test]
+    async fn head_and_get_describe_a_file_alike() {
+        let described = [
+            http::header::ETAG,
+            http::header::LAST_MODIFIED,
+            http::header::CONTENT_LENGTH,
+            http::header::CONTENT_RANGE,
+            http::header::CONTENT_TYPE,
+            http::header::ACCEPT_RANGES,
+        ];
+        for limit in [0, 1024] {
+            let (_root, app) = conditional_file_app(limit);
+            for headers in [vec![], vec![(http::header::RANGE, "bytes=2-4".to_owned())]] {
+                let mut descriptions = Vec::new();
+                for method in [http::Method::GET, http::Method::HEAD] {
+                    let response = file_response(&app, method, &headers).await;
+                    let description: Vec<_> = described
+                        .iter()
+                        .map(|name| response.headers().get(name).cloned())
+                        .collect();
+                    descriptions.push((response.status(), description));
+                }
+                assert!(descriptions[0].1[0].is_some(), "limit {limit}: {headers:?}");
+                assert_eq!(
+                    descriptions[0], descriptions[1],
+                    "limit {limit}: {headers:?}"
+                );
+            }
         }
     }
 
@@ -927,7 +975,6 @@ mod tests {
 
     // Replacing the file after the router opened it must not change what is
     // streamed: the response reads the handle the router opened.
-    #[cfg(unix)]
     #[tokio::test]
     async fn streaming_uses_the_confined_handle_after_path_replacement() {
         let root = tempfile::tempdir().unwrap();
@@ -937,8 +984,8 @@ mod tests {
         fs::write(outside.path().join("file.txt"), b"outside secret").unwrap();
         let state = AppState::new(root.path(), utils::cache::Config::default()).unwrap();
         let file = state.store.open_file(&path).await.unwrap();
-        fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(outside.path().join("file.txt"), &path).unwrap();
+        fs::rename(&path, root.path().join("old.txt")).unwrap();
+        link_file(&outside.path().join("file.txt"), &path);
         let response = utils::http::streamed_response(
             file,
             &path,
@@ -1603,7 +1650,6 @@ mod tests {
             );
         }
 
-        #[cfg(unix)]
         #[tokio::test]
         async fn a_subtree_leaves_out_a_listing_reached_through_a_symlink() {
             // The cached root listing names other_test_dir as a directory,
@@ -1613,11 +1659,10 @@ mod tests {
             let state = setup_test_env(temp.path());
             state.store.directory_listing("").await.unwrap();
             fs::remove_dir(temp.path().join("other_test_dir")).unwrap();
-            std::os::unix::fs::symlink(
-                temp.path().join("test_dir"),
-                temp.path().join("other_test_dir"),
-            )
-            .unwrap();
+            link_dir(
+                &temp.path().join("test_dir"),
+                &temp.path().join("other_test_dir"),
+            );
 
             let resp = subtree_of(&state, "").await;
             assert!(!no_store(&resp));
@@ -4019,14 +4064,12 @@ mod tests {
             assert!(!no_store(&get(&state, "/get_dir_entry_info?path=test_dir/file_in_dir.txt").await));
         }
 
-        #[cfg(unix)]
         #[tokio::test]
         async fn an_answer_reached_through_a_symlink_is_never_vouched_for() {
             // The watcher names the target; a client caching under the link's
             // name would never hear about it.
             let (temp, state) = live(utils::cache::Config::default());
-            std::os::unix::fs::symlink(temp.path().join("test_dir"), temp.path().join("alias"))
-                .unwrap();
+            link_dir(&temp.path().join("test_dir"), &temp.path().join("alias"));
 
             assert!(no_store(&get(&state, "/get_dir_info?path=alias").await));
             assert!(no_store(&get(&state, "/get_dir_entry_info?path=alias/file_in_dir.txt").await));
