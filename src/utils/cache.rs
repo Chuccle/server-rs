@@ -27,7 +27,8 @@
 //! Successful resolutions are cached; failures never are, so a rejected path is
 //! re-validated from scratch every time. The filesystem watcher drops
 //! resolutions whose canonical path sits at or under anything created, removed
-//! or renamed, and every entry is additionally bounded by TTL.
+//! or renamed, along with every resolution that went through a symlink, and
+//! every entry is additionally bounded by TTL.
 //!
 //! # Coherence with the change feed
 //!
@@ -932,7 +933,9 @@ impl Store {
     /// The tree itself moved. Renames and directory removals relocate whole
     /// subtrees, so anything that resolved at or *through* one of `roots` has to
     /// go - including resolutions, which can only be matched on the canonical
-    /// path they produced, since their keys are request strings.
+    /// path they produced, since their keys are request strings. A symlink
+    /// created, removed or renamed changes what paths through it resolve to,
+    /// so every resolution that went through a symlink goes too.
     pub async fn invalidate_subtree(&self, roots: &[PathBuf]) {
         for root in roots {
             self.dirs.invalidate(root).await;
@@ -968,10 +971,14 @@ impl Store {
             }
         }
 
+        // A resolution through a symlink ends under the symlink's target, so
+        // an event naming the symlink matches none of them, and which symlinks
+        // it went through is not kept.
         for (key, value) in &self.resolved {
-            if roots
-                .iter()
-                .any(|root| value.value.canonical.starts_with(root))
+            if value.value.aliased
+                || roots
+                    .iter()
+                    .any(|root| value.value.canonical.starts_with(root))
             {
                 self.resolved.invalidate(&*key).await;
             }

@@ -3237,6 +3237,56 @@ mod tests {
             assert!(!state.store.has_directory(&root));
         }
 
+        // Replacing a symlink changes what every path through it resolves to,
+        // though none of those paths ends under the symlink.
+        #[tokio::test]
+        async fn retargeting_a_symlink_drops_resolutions_through_it() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            for (directory, contents) in [("a", "first"), ("b", "second")] {
+                fs::create_dir(temp.path().join(directory)).unwrap();
+                fs::write(temp.path().join(directory).join("f.txt"), contents).unwrap();
+            }
+            let link = state.store.base().join("link");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("a", &link).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir("a", &link).unwrap();
+            let app = build_router(Arc::clone(&state));
+            let read = || async {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/get_file?path=link/f.txt")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                response.into_body().collect().await.unwrap().to_bytes()
+            };
+            assert_eq!(read().await, "first");
+
+            #[cfg(unix)]
+            {
+                fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink("b", &link).unwrap();
+            }
+            #[cfg(windows)]
+            {
+                fs::remove_dir(&link).unwrap();
+                std::os::windows::fs::symlink_dir("b", &link).unwrap();
+            }
+            let events = [
+                event(EventKind::Remove(RemoveKind::Any), &[&link]),
+                event(EventKind::Create(CreateKind::Any), &[&link]),
+            ];
+            utils::cache::handle_fs_events(&events, &state.store).await;
+
+            assert_eq!(read().await, "second");
+        }
+
         #[tokio::test]
         async fn a_rescan_flag_drops_every_cache_regardless_of_other_events() {
             let temp = tempfile::tempdir().unwrap();
