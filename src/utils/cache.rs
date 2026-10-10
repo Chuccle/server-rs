@@ -159,9 +159,11 @@ pub struct DirNode {
 /// Below this many entries, thread-spawn overhead costs more than the
 /// syscalls it would save. Chosen from measurement, not a guess: see
 /// `dir_node/scan` in `benches/hot_path.rs` and the note in `BENCHMARKING.md`.
+#[cfg(not(windows))]
 const PARALLEL_STAT_THRESHOLD: usize = 512;
 
 /// Entries per worker below which another worker isn't worth starting.
+#[cfg(not(windows))]
 const MIN_CHUNK: usize = 128;
 
 /// `DirEntry::metadata` is one `statx` each, and for a large directory that
@@ -172,6 +174,7 @@ const MIN_CHUNK: usize = 128;
 /// Plain threads rather than a `rayon`/tokio dependency: this runs once per
 /// cache miss, already inside `spawn_blocking`, and needs nothing beyond
 /// "run N closures, join them" - not a dependency's work-stealing scheduler.
+#[cfg(not(windows))]
 fn stat_children(entries: &[cap_std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> {
     fn stat_one(entry: &cap_std::fs::DirEntry) -> Option<(Box<str>, RawMeta)> {
         // The schema carries UTF-8 names, and a non-UTF-8 name could not be
@@ -214,6 +217,24 @@ fn stat_children(entries: &[cap_std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> 
     })
 }
 
+/// Each child of an opened directory with a UTF-8 name, and its metadata.
+#[cfg(not(windows))]
+fn list_children(directory: &cap_std::fs::Dir) -> std::io::Result<Vec<(Box<str>, RawMeta)>> {
+    let entries: Vec<cap_std::fs::DirEntry> = directory
+        .entries()?
+        .filter_map(std::result::Result::ok)
+        .collect();
+
+    Ok(stat_children(&entries))
+}
+
+/// cap-std lists a directory on Windows by a pathname rebuilt from its handle,
+/// so this enumerates the handle itself.
+#[cfg(windows)]
+fn list_children(directory: &cap_std::fs::Dir) -> std::io::Result<Vec<(Box<str>, RawMeta)>> {
+    crate::utils::windows::directory::children(directory)
+}
+
 impl DirNode {
     /// Read a directory and encode everything the hot path will ever need.
     ///
@@ -240,12 +261,7 @@ impl DirNode {
             return Err(AppError::NotFound);
         }
 
-        let entries: Vec<cap_std::fs::DirEntry> = directory
-            .entries()?
-            .filter_map(std::result::Result::ok)
-            .collect();
-
-        let mut children = stat_children(&entries);
+        let mut children = list_children(directory)?;
 
         children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
@@ -1231,6 +1247,66 @@ mod tests {
                 .unwrap();
         assert_eq!(entry.size(), 9);
         assert!(!entry.directory());
+    }
+
+    // `dir.` and `dir` are two directories. Listing by a pathname rebuilt
+    // from the handle normalised the trailing dot away and listed `dir`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_listing_is_of_the_directory_opened_when_its_name_ends_in_a_dot() {
+        let root = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(base.join("dir")).unwrap();
+        std::fs::write(base.join("dir").join("plain"), b"x").unwrap();
+        std::fs::create_dir(base.join("dir.")).unwrap();
+        std::fs::write(base.join("dir.").join("dotted"), b"xy").unwrap();
+        let store = Store::new(root.path(), Config::default()).unwrap();
+        let canonical = store.base().join("dir.");
+        let (node, _, _) = store.dir_node(&canonical).await.unwrap();
+        assert_eq!(node.child("dotted").map(|meta| meta.size), Some(2));
+        assert!(node.child("plain").is_none());
+    }
+
+    // A root on a share canonicalises to `\\?\UNC\...`, which the pathname
+    // round trip turned into a relative path. Skipped where the machine has
+    // no administrative share to reach its own disk through.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_root_on_a_unc_share_lists() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"x").unwrap();
+        let local = std::fs::canonicalize(root.path()).unwrap();
+        let local = local.to_str().unwrap();
+        let (drive, rest) = local.trim_start_matches(r"\\?\").split_at(1);
+        let share = PathBuf::from(format!(r"\\localhost\{drive}${}", &rest[1..]));
+        let Ok(store) = Store::new(&share, Config::default()) else {
+            eprintln!(
+                "a_root_on_a_unc_share_lists: {} is not reachable; nothing to test",
+                share.display()
+            );
+            return;
+        };
+        assert!(store.base().to_str().unwrap().starts_with(r"\\?\UNC\"));
+        let (node, _, _) = store.dir_node(store.base()).await.unwrap();
+        assert_eq!(node.child("file").map(|meta| meta.size), Some(1));
+    }
+
+    // A listing reports a symlink as itself, as `DirEntry::metadata` does on
+    // unix, not as the directory it points at.
+    #[cfg(windows)]
+    #[test]
+    fn a_listing_reports_a_directory_symlink_as_not_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        if std::os::windows::fs::symlink_dir("target", root.path().join("link")).is_err() {
+            eprintln!(
+                "a_listing_reports_a_directory_symlink_as_not_a_directory: cannot create symlinks; nothing to test"
+            );
+            return;
+        }
+        let node = DirNode::scan(root.path()).unwrap();
+        assert!(node.child("target").unwrap().is_dir);
+        assert!(!node.child("link").unwrap().is_dir);
     }
 
     /// Build a directory and scan it, so the index under test is the one the
