@@ -1200,7 +1200,6 @@ mod tests {
 
     // Make the parent listing miss while preserving warm resolution. This
     // forces the real direct-stat fallback rather than serving safe old bytes.
-    #[cfg(unix)]
     #[tokio::test]
     async fn direct_metadata_fallback_cannot_escape_a_warm_resolution() {
         let root = tempfile::tempdir().unwrap();
@@ -1211,7 +1210,10 @@ mod tests {
         let store = Store::new(root.path(), Config::default()).unwrap();
         store.entry_metadata("dir/file").await.unwrap();
         std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), root.path().join("dir")).unwrap();
         store.dirs.invalidate_all();
         assert_eq!(
             store.entry_metadata("dir/file").await.unwrap_err(),
