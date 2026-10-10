@@ -65,14 +65,20 @@ fn parse_options() -> Result<Options, String> {
             "--address" => options.address = value_for(&flag, &mut args)?,
             "--target" => options.target = value_for(&flag, &mut args)?,
             "--connections" => {
-                options.connections = value_for(&flag, &mut args)?.parse().map_err(|_| "bad --connections")?;
+                options.connections = value_for(&flag, &mut args)?
+                    .parse()
+                    .map_err(|_| "bad --connections")?;
             }
             "--duration" => {
-                let seconds = value_for(&flag, &mut args)?.parse().map_err(|_| "bad --duration")?;
+                let seconds = value_for(&flag, &mut args)?
+                    .parse()
+                    .map_err(|_| "bad --duration")?;
                 options.duration = std::time::Duration::from_secs(seconds);
             }
             "--warmup" => {
-                let seconds = value_for(&flag, &mut args)?.parse().map_err(|_| "bad --warmup")?;
+                let seconds = value_for(&flag, &mut args)?
+                    .parse()
+                    .map_err(|_| "bad --warmup")?;
                 options.warmup = std::time::Duration::from_secs(seconds);
             }
             "--help" | "-h" => return Err(usage()),
@@ -132,7 +138,9 @@ impl Connection {
 
         if !self.buffer.starts_with(b"HTTP/1.1 200") {
             let status = String::from_utf8_lossy(&self.buffer[..head.min(64)]).into_owned();
-            return Err(std::io::Error::other(format!("unexpected status: {status}")));
+            return Err(std::io::Error::other(format!(
+                "unexpected status: {status}"
+            )));
         }
 
         let length = content_length(&self.buffer[..head])

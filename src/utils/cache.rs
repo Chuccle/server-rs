@@ -213,7 +213,11 @@ fn stat_children(entries: &[cap_std::fs::DirEntry]) -> Vec<(Box<str>, RawMeta)> 
             // A worker can only fail by panicking, which already unwinds the
             // process in a `spawn_blocking` context - nothing here downgrades
             // that into a silently dropped directory chunk.
-            .flat_map(|worker| worker.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            })
             .collect()
     })
 }
@@ -686,9 +690,12 @@ impl Store {
                 let (batch, rest) = pending.split_at(size);
                 pending = rest;
 
-                let found =
-                    join_all(batch.iter().map(|(_, _, child_key)| self.subtree_child(child_key)))
-                        .await;
+                let found = join_all(
+                    batch
+                        .iter()
+                        .map(|(_, _, child_key)| self.subtree_child(child_key)),
+                )
+                .await;
 
                 for ((parent, subdirectory, child_key), found) in batch.iter().zip(found) {
                     let Some((child, child_origin)) = found else {
@@ -1009,7 +1016,10 @@ impl Store {
     pub async fn plant_directory(&self, canonical: &Path, generation: u64) {
         let node = DirNode::scan(&self.root.open_dir(canonical).expect("open")).expect("scan");
         self.dirs
-            .insert(canonical.to_path_buf(), Stamped::new(Arc::new(node), generation))
+            .insert(
+                canonical.to_path_buf(),
+                Stamped::new(Arc::new(node), generation),
+            )
             .await;
     }
 
@@ -1186,9 +1196,12 @@ pub async fn handle_fs_events(events: &[notify_debouncer_full::DebouncedEvent], 
     let changes = contents
         .into_iter()
         .map(|key| (key, Kind::Modified))
-        .chain(structure.into_iter().zip(exists).map(|(key, exists)| {
-            (key, if exists { Kind::Created } else { Kind::Removed })
-        }))
+        .chain(
+            structure
+                .into_iter()
+                .zip(exists)
+                .map(|(key, exists)| (key, if exists { Kind::Created } else { Kind::Removed })),
+        )
         .collect();
 
     store.feed.publish(generation, changes);

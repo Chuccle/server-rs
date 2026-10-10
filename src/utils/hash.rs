@@ -38,13 +38,17 @@ pub fn name(name: &str) -> u64 {
     let (chunks, remainder) = name.as_bytes().as_chunks::<8>();
 
     for chunk in chunks {
-        state = (state ^ u64::from_le_bytes(*chunk)).wrapping_mul(MIX).rotate_left(31);
+        state = (state ^ u64::from_le_bytes(*chunk))
+            .wrapping_mul(MIX)
+            .rotate_left(31);
     }
 
     if !remainder.is_empty() {
         let mut word = [0u8; 8];
         word[..remainder.len()].copy_from_slice(remainder);
-        state = (state ^ u64::from_le_bytes(word)).wrapping_mul(MIX).rotate_left(31);
+        state = (state ^ u64::from_le_bytes(word))
+            .wrapping_mul(MIX)
+            .rotate_left(31);
     }
 
     avalanche(state ^ u64::try_from(name.len()).unwrap_or(u64::MAX))
@@ -133,7 +137,14 @@ mod tests {
     #[test]
     fn distinct_names_hash_apart() {
         let names = [
-            "", "a", "b", "ab", "ba", "file.txt", "file.txr", "file.txt ",
+            "",
+            "a",
+            "b",
+            "ab",
+            "ba",
+            "file.txt",
+            "file.txr",
+            "file.txt ",
             "a_rather_longer_name_that_spans_several_words.tar.gz",
             "a_rather_longer_name_that_spans_several_words.tar.gy",
         ];

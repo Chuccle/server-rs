@@ -1486,10 +1486,16 @@ mod tests {
                     .unwrap()
                     .to_owned();
                 let listing = descendant.listing().unwrap();
-                let entries = listing.subdirectories().unwrap().len() + listing.files().unwrap().len();
+                let entries =
+                    listing.subdirectories().unwrap().len() + listing.files().unwrap().len();
 
                 assert!(listing.descendants().is_none());
-                out.push((descendant.parent(), descendant.subdirectory(), name, entries));
+                out.push((
+                    descendant.parent(),
+                    descendant.subdirectory(),
+                    name,
+                    entries,
+                ));
                 listings.push(listing);
             }
 
@@ -3186,9 +3192,9 @@ mod tests {
         use notify_debouncer_full::notify::{Event, EventKind};
 
         fn event(kind: EventKind, paths: &[&std::path::Path]) -> DebouncedEvent {
-            let event = paths
-                .iter()
-                .fold(Event::new(kind), |event, path| event.add_path(path.to_path_buf()));
+            let event = paths.iter().fold(Event::new(kind), |event, path| {
+                event.add_path(path.to_path_buf())
+            });
 
             DebouncedEvent::new(event, std::time::Instant::now())
         }
@@ -3269,10 +3275,7 @@ mod tests {
             let (target, _, _, _) = state.store.file_content("test_file.txt").await.unwrap();
             assert!(state.store.has_content(&target));
 
-            let events = [event(
-                EventKind::Remove(RemoveKind::File),
-                &[&target],
-            )];
+            let events = [event(EventKind::Remove(RemoveKind::File), &[&target])];
 
             utils::cache::handle_fs_events(&events, &state.store).await;
 
@@ -3540,9 +3543,9 @@ mod tests {
         }
 
         fn event(kind: EventKind, paths: &[&std::path::Path]) -> DebouncedEvent {
-            let event = paths
-                .iter()
-                .fold(Event::new(kind), |event, path| event.add_path(path.to_path_buf()));
+            let event = paths.iter().fold(Event::new(kind), |event, path| {
+                event.add_path(path.to_path_buf())
+            });
 
             DebouncedEvent::new(event, std::time::Instant::now())
         }
@@ -3616,12 +3619,12 @@ mod tests {
 
             let bytes = response.collect().await.unwrap().to_bytes();
             let batch = flatbuffers::root::<ChangeBatch>(&bytes).unwrap();
-            let strings = |paths: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<&str>>>| {
-                let mut paths: Vec<String> =
-                    paths.unwrap().iter().map(str::to_owned).collect();
-                paths.sort();
-                paths
-            };
+            let strings =
+                |paths: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<&str>>>| {
+                    let mut paths: Vec<String> = paths.unwrap().iter().map(str::to_owned).collect();
+                    paths.sort();
+                    paths
+                };
 
             Batch {
                 epoch: batch.epoch(),
@@ -3714,7 +3717,10 @@ mod tests {
             assert_eq!(batch.created, vec!["test_dir/new_dir".to_owned()]);
 
             let since_the_create = poll(&state, epoch, 1).await;
-            assert_eq!(since_the_create.modified, vec!["test_dir/new_dir".to_owned()]);
+            assert_eq!(
+                since_the_create.modified,
+                vec!["test_dir/new_dir".to_owned()]
+            );
             assert_eq!(since_the_create.created, Vec::<String>::new());
         }
 
@@ -3784,7 +3790,9 @@ mod tests {
 
             assert!(!batch.reset);
             assert_eq!(batch.generation, 0);
-            assert!(batch.modified.is_empty() && batch.created.is_empty() && batch.removed.is_empty());
+            assert!(
+                batch.modified.is_empty() && batch.created.is_empty() && batch.removed.is_empty()
+            );
         }
 
         #[tokio::test]
@@ -4061,7 +4069,9 @@ mod tests {
 
             assert!(state.store.has_directory(&directory));
             assert!(!no_store(&get(&state, "/get_dir_info?path=test_dir").await));
-            assert!(!no_store(&get(&state, "/get_dir_entry_info?path=test_dir/file_in_dir.txt").await));
+            assert!(!no_store(
+                &get(&state, "/get_dir_entry_info?path=test_dir/file_in_dir.txt").await
+            ));
         }
 
         #[tokio::test]
@@ -4072,8 +4082,12 @@ mod tests {
             link_dir(&temp.path().join("test_dir"), &temp.path().join("alias"));
 
             assert!(no_store(&get(&state, "/get_dir_info?path=alias").await));
-            assert!(no_store(&get(&state, "/get_dir_entry_info?path=alias/file_in_dir.txt").await));
-            assert!(no_store(&get(&state, "/get_file?path=alias/file_in_dir.txt").await));
+            assert!(no_store(
+                &get(&state, "/get_dir_entry_info?path=alias/file_in_dir.txt").await
+            ));
+            assert!(no_store(
+                &get(&state, "/get_file?path=alias/file_in_dir.txt").await
+            ));
             assert!(!no_store(&get(&state, "/get_dir_info?path=test_dir").await));
         }
     }

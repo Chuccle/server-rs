@@ -239,7 +239,8 @@ impl Feed {
                 continue;
             }
 
-            newest.entry(&change.path)
+            newest
+                .entry(&change.path)
                 .and_modify(|kind| {
                     if *kind == Kind::Modified {
                         *kind = change.kind;
@@ -294,13 +295,21 @@ impl Batch {
 
     /// Encode as the `ChangeBatch` the schema defines.
     pub fn encode(&self, epoch: u64) -> Bytes {
-        let paths = || self.modified.iter().chain(&self.created).chain(&self.removed);
+        let paths = || {
+            self.modified
+                .iter()
+                .chain(&self.created)
+                .chain(&self.removed)
+        };
         let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(
             128 + paths().map(|path| path.len() + 8).sum::<usize>(),
         );
 
         let mut strings = |paths: &[Box<str>]| {
-            let offsets: Vec<_> = paths.iter().map(|path| builder.create_string(path)).collect();
+            let offsets: Vec<_> = paths
+                .iter()
+                .map(|path| builder.create_string(path))
+                .collect();
             offsets
         };
 
