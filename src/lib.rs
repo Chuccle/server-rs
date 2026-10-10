@@ -213,7 +213,8 @@ pub async fn get_file_handler(
         // a cached canonical pathname here would reintroduce traversal races.
         utils::cache::Content::Streamed => {
             let file = data.store.open_file(&canonical).await?;
-            utils::http::streamed_response(file, &canonical, request).await?
+            utils::http::streamed_response(file, &canonical, request.method(), request.headers())
+                .await?
         }
     };
 
@@ -828,6 +829,103 @@ mod tests {
         }
     }
 
+    // One evaluation decides preconditions and ranges for a resident file and
+    // a streamed one, so the same request gets the same answer from both.
+    #[tokio::test]
+    async fn resident_and_streamed_files_answer_alike() {
+        const MODIFIED: &str = "Sun, 13 Sep 2020 12:26:40 GMT";
+        const BEFORE: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+        const AFTER: &str = "Mon, 21 Oct 2030 07:28:00 GMT";
+        let mut answers = Vec::new();
+        for limit in [1024, 0] {
+            let (_root, app) = conditional_file_app(limit);
+            let response = file_response(&app, http::Method::GET, &[]).await;
+            let etag = response.headers()[http::header::ETAG]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let cases = [
+                (vec![(http::header::IF_MATCH, etag.clone())], 200),
+                (vec![(http::header::IF_MATCH, "*".to_owned())], 200),
+                (
+                    vec![(http::header::IF_MATCH, format!("\"a,b\" , {etag}"))],
+                    200,
+                ),
+                (vec![(http::header::IF_MATCH, "\"other\"".to_owned())], 412),
+                (vec![(http::header::IF_MATCH, format!("W/{etag}"))], 412),
+                (
+                    vec![
+                        (http::header::IF_MATCH, etag.clone()),
+                        (http::header::IF_UNMODIFIED_SINCE, BEFORE.to_owned()),
+                    ],
+                    200,
+                ),
+                (
+                    vec![(http::header::IF_UNMODIFIED_SINCE, BEFORE.to_owned())],
+                    412,
+                ),
+                (
+                    vec![(http::header::IF_UNMODIFIED_SINCE, MODIFIED.to_owned())],
+                    200,
+                ),
+                (
+                    vec![(http::header::IF_UNMODIFIED_SINCE, "soon".to_owned())],
+                    200,
+                ),
+                (
+                    vec![(http::header::IF_NONE_MATCH, format!("\"other\", W/{etag}"))],
+                    304,
+                ),
+                (vec![(http::header::IF_NONE_MATCH, "*".to_owned())], 304),
+                (
+                    vec![
+                        (http::header::IF_NONE_MATCH, "\"other\"".to_owned()),
+                        (http::header::IF_MODIFIED_SINCE, AFTER.to_owned()),
+                    ],
+                    200,
+                ),
+                (
+                    vec![(http::header::IF_MODIFIED_SINCE, MODIFIED.to_owned())],
+                    304,
+                ),
+                (
+                    vec![(http::header::IF_MODIFIED_SINCE, BEFORE.to_owned())],
+                    200,
+                ),
+                (vec![(http::header::RANGE, "bytes=2-4".to_owned())], 206),
+                (vec![(http::header::RANGE, "bytes=-3".to_owned())], 206),
+                (vec![(http::header::RANGE, "bytes=0-1,4-5".to_owned())], 416),
+                (vec![(http::header::RANGE, "bytes=20-30".to_owned())], 416),
+                (vec![(http::header::RANGE, "bytes=oops".to_owned())], 416),
+                (
+                    vec![
+                        (http::header::IF_MATCH, "\"other\"".to_owned()),
+                        (http::header::RANGE, "bytes=2-4".to_owned()),
+                    ],
+                    412,
+                ),
+                (
+                    vec![
+                        (http::header::IF_NONE_MATCH, etag.clone()),
+                        (http::header::RANGE, "bytes=2-4".to_owned()),
+                    ],
+                    304,
+                ),
+            ];
+            let mut seen = Vec::new();
+            for (headers, status) in cases {
+                let response = file_response(&app, http::Method::GET, &headers).await;
+                assert_eq!(response.status(), status, "limit {limit}: {headers:?}");
+                let range = response.headers().get(http::header::CONTENT_RANGE).cloned();
+                let tag = response.headers().get(http::header::ETAG).cloned();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                seen.push((status, range, tag, body));
+            }
+            answers.push(seen);
+        }
+        assert_eq!(answers[0], answers[1]);
+    }
+
     // Replacing the file after the router opened it must not change what is
     // streamed: the response reads the handle the router opened.
     #[cfg(unix)]
@@ -845,10 +943,8 @@ mod tests {
         let response = utils::http::streamed_response(
             file,
             &path,
-            Request::builder()
-                .uri("/get_file?path=file.txt")
-                .body(Body::empty())
-                .unwrap(),
+            &http::Method::GET,
+            &http::HeaderMap::new(),
         )
         .await
         .unwrap();

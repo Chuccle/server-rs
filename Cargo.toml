@@ -37,8 +37,8 @@ axum = "0.8.9"
 dotenvy = { version = "0.15.7", optional = true }
 env_logger = { version = "0.11.10", optional = true }
 flatbuffers = "25.12.19"
-# Already in the tree via axum/hyper/tower-http; naming them directly lets the
-# cache hand out refcounted response bodies and pre-render file headers.
+# Already in the tree via axum/hyper; naming them directly lets the cache hand
+# out refcounted response bodies and pre-render file headers.
 bytes = "1.11.1"
 httpdate = "1.0.3"
 http-range-header = "0.4.2"
@@ -50,6 +50,7 @@ thiserror = "2.0.18"
 # unrelated crate drops a feature.
 tokio = { version = "1.52.3", features = [
     "fs",
+    "io-util",
     "macros",
     "net",
     "rt-multi-thread",
@@ -57,7 +58,8 @@ tokio = { version = "1.52.3", features = [
     "time",
 ] }
 notify-debouncer-full = "0.7.0"
-tower-http = { version = "0.7.0", features = ["fs"] }
+# Streams a file too large to hold resident off the handle the router opened.
+tokio-util = { version = "0.7.19", features = ["io"] }
 moka = {  version = "0.12.15", features = ["future"] }
 # Already in the tree via axum/hyper; subtree listings look up a batch of
 # directories at once.
