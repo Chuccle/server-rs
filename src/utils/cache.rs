@@ -1078,10 +1078,17 @@ fn load_content(
     }
 
     let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut data)?;
+    file.by_ref()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut data)?;
 
-    // Trust what was actually read over what the metadata claimed.
+    // Trust what was actually read over what the metadata claimed. A file
+    // that grew past the limit since is streamed, from the handle.
     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+
+    if len > limit {
+        return Ok((Content::Streamed, Some(file)));
+    }
 
     Ok((
         Content::Resident(Arc::new(FileNode {
@@ -1235,6 +1242,26 @@ mod tests {
             assert!(matches!(served, Served::Streamed(_)));
             assert_eq!(from, origin);
             assert_eq!(walks(), request);
+        }
+    }
+
+    // A file reads past the size its metadata gave, as one that grows between
+    // the two does. procfs reports its files as empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resident_load_stops_at_the_limit() {
+        let base = std::fs::canonicalize("/proc/self").unwrap();
+        let root = path::Root::new(&base).unwrap();
+        let status = base.join("status");
+        assert_eq!(std::fs::metadata(&status).unwrap().len(), 0);
+        assert!(std::fs::read(&status).unwrap().len() > 16);
+        match load_content(&root, &status, 16).unwrap() {
+            (Content::Streamed, Some(mut file)) => {
+                use std::io::Seek as _;
+                assert_eq!(file.stream_position().unwrap(), 17);
+            }
+            (Content::Resident(node), _) => panic!("held {} bytes", node.data.len()),
+            (Content::Streamed, None) => panic!("streamed without its handle"),
         }
     }
 
