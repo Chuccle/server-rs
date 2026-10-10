@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "master" ]
   pull_request:
-    branches: [ "master" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -161,3 +160,59 @@ jobs:
 
     - name: Clippy
       run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+  windows-test:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: |
+        echo "is_dependabot=false" >> $GITHUB_OUTPUT
+        if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+          echo "is_dependabot=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v7
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-msvc-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      run: echo "flatc_hash=$(git -C buildtools/flatbuffers rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Cache Flatc build
+      id: cache_flatc
+      uses: actions/cache@v6
+      with:
+        path: ~/flatc
+        key: ${{ runner.os }}-flatc-bin-${{ steps.flatc_hash.outputs.flatc_hash }}
+
+    - name: Build Flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
+      run: |
+        cmake -S buildtools/flatbuffers -B "$RUNNER_TEMP/flatc-build" \
+          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
+        cmake --build "$RUNNER_TEMP/flatc-build" --config Release --target flatc -j
+        mkdir -p ~/flatc && cp "$RUNNER_TEMP/flatc-build/Release/flatc.exe" ~/flatc/
+
+    - name: Put Flatc on the path
+      run: cygpath -w ~/flatc >> $GITHUB_PATH
+
+    - name: Test ${{ github.repository }}
+      run: cargo test --locked --verbose
