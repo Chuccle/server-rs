@@ -464,6 +464,13 @@ pub enum Content {
     Streamed,
 }
 
+/// What the file endpoint serves.
+pub enum Served {
+    Resident(Arc<FileNode>),
+    /// The file opened beneath the export root, to stream from.
+    Streamed(std::fs::File),
+}
+
 type PathCache<V> = moka::future::Cache<PathBuf, Arc<Stamped<V>>, RandomState>;
 type KeyCache<V> = moka::future::Cache<String, Arc<Stamped<V>>, RandomState>;
 
@@ -768,15 +775,19 @@ impl Store {
 
     /// Resolve a file request and decide how to serve it.
     ///
+    /// A streamed file is opened once per request: by the load that found it
+    /// too large to hold when this request ran that load, and here otherwise.
+    ///
     /// # Errors
     ///
     /// Traversal, missing path, or permission denied.
     pub async fn file_content(
         &self,
         raw: &str,
-    ) -> Result<(Arc<Path>, Content, Origin, Freshness), AppError> {
+    ) -> Result<(Arc<Path>, Served, Origin, Freshness), AppError> {
         let key = path::normalize(raw)?;
         let (canonical, resolved, named) = self.resolve(&key).await?;
+        let mut opened = None;
 
         let (entry, origin) = if let Some(entry) = self.contents.get(&*canonical).await {
             (entry, resolved)
@@ -786,14 +797,16 @@ impl Store {
             let root = Arc::clone(&self.root);
             let limit = self.config.max_resident_file_bytes;
             let generation = self.feed.current();
+            let opened = &mut opened;
 
             let entry = self
                 .contents
                 .try_get_with(cache_key, async move {
-                    let content =
+                    let (content, file) =
                         tokio::task::spawn_blocking(move || load_content(&root, &load_path, limit))
                             .await
                             .map_err(AppError::from)??;
+                    *opened = file;
 
                     Ok::<_, AppError>(Stamped::new(content, generation))
                 })
@@ -808,12 +821,13 @@ impl Store {
             self.contents.invalidate(&*canonical).await;
         }
 
-        Ok((
-            canonical,
-            entry.value.clone(),
-            origin,
-            named.and(Freshness::of(vouched)),
-        ))
+        let served = match (&entry.value, opened) {
+            (Content::Resident(node), _) => Served::Resident(Arc::clone(node)),
+            (Content::Streamed, Some(file)) => Served::Streamed(file),
+            (Content::Streamed, None) => Served::Streamed(self.open_file(&canonical).await?),
+        };
+
+        Ok((canonical, served, origin, named.and(Freshness::of(vouched))))
     }
 
     /// Request key to canonical path, coalescing concurrent cold lookups so a
@@ -1043,8 +1057,13 @@ impl Store {
 /// Open once, then decide from the handle's own metadata whether to hold the
 /// file resident. Reading metadata off the open handle rather than the path
 /// saves a syscall and closes the window where the path could change underneath
-/// us.
-fn load_content(root: &path::Root, path: &Path, limit: u64) -> Result<Content, AppError> {
+/// us. A file too large to hold comes back with its handle, which the request
+/// that loaded it streams.
+fn load_content(
+    root: &path::Root,
+    path: &Path,
+    limit: u64,
+) -> Result<(Content, Option<std::fs::File>), AppError> {
     use std::io::Read as _;
 
     let mut file = root.open(path)?;
@@ -1055,7 +1074,7 @@ fn load_content(root: &path::Root, path: &Path, limit: u64) -> Result<Content, A
     }
 
     if metadata.len() > limit {
-        return Ok(Content::Streamed);
+        return Ok((Content::Streamed, Some(file)));
     }
 
     let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
@@ -1064,10 +1083,13 @@ fn load_content(root: &path::Root, path: &Path, limit: u64) -> Result<Content, A
     // Trust what was actually read over what the metadata claimed.
     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
-    Ok(Content::Resident(Arc::new(FileNode {
-        data: Bytes::from(data),
-        representation: crate::utils::http::Representation::of(path, &metadata, len),
-    })))
+    Ok((
+        Content::Resident(Arc::new(FileNode {
+            data: Bytes::from(data),
+            representation: crate::utils::http::Representation::of(path, &metadata, len),
+        })),
+        None,
+    ))
 }
 
 /// Translate a debounced batch of filesystem events into cache invalidations,
@@ -1193,6 +1215,27 @@ mod tests {
             store.entry_metadata("dir/file").await.unwrap_err(),
             AppError::PermissionDenied
         );
+    }
+
+    // The load that finds a file too large to hold has it open already, so a
+    // cold request streams that handle rather than walking the path again.
+    #[tokio::test]
+    async fn a_streamed_file_is_opened_once_per_request() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file"), b"streamed").unwrap();
+        let config = Config {
+            max_resident_file_bytes: 4,
+            ..Config::default()
+        };
+        let store = Store::new(root.path(), config).unwrap();
+        let walks = || store.root.walks.load(Ordering::Relaxed);
+        for (request, origin) in [(1, Origin::Filesystem), (2, Origin::Cache)] {
+            let (_, served, from, _) = store.file_content("dir/file").await.unwrap();
+            assert!(matches!(served, Served::Streamed(_)));
+            assert_eq!(from, origin);
+            assert_eq!(walks(), request);
+        }
     }
 
     // The entry appeared after its parent was cached. A successful direct

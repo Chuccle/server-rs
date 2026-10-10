@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Root {
     base: PathBuf,
     directory: cap_std::fs::Dir,
+    /// Accesses made through the root, retries included.
+    #[cfg(test)]
+    pub(crate) walks: std::sync::atomic::AtomicUsize,
 }
 
 impl Root {
@@ -23,6 +26,8 @@ impl Root {
         Ok(Self {
             base: base.to_path_buf(),
             directory: cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority())?,
+            #[cfg(test)]
+            walks: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -41,20 +46,34 @@ impl Root {
     /// pointing inside the root, so retry once using its current canonical
     /// spelling. The retry still accesses through the capability, never an
     /// ambient open of the newly canonicalised pathname.
+    ///
+    /// cap-std refuses an escape with an error of its own, which carries no
+    /// OS code; one that does is the filesystem denying access, which a second
+    /// spelling cannot change.
     fn access<T>(
         &self,
         path: &Path,
         operation: impl Fn(&Path) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
-        let result = operation(self.relative(path)?);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
-        {
+        let result = self.walk(path, &operation);
+        if result.as_ref().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::PermissionDenied && error.raw_os_error().is_none()
+        }) {
             let canonical = std::fs::canonicalize(path)?;
-            return operation(self.relative(&canonical)?);
+            return self.walk(&canonical, &operation);
         }
         result
+    }
+
+    fn walk<T>(
+        &self,
+        path: &Path,
+        operation: impl Fn(&Path) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        #[cfg(test)]
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        operation(self.relative(path)?)
     }
 
     pub(crate) fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
@@ -307,6 +326,47 @@ mod tests {
         assert!(rejected("C:/Windows/win.ini"));
         assert!(rejected("C:\\Windows\\win.ini"));
         assert!(rejected("file.txt:hidden"));
+    }
+
+    /// The code the filesystem denies access with.
+    #[cfg(unix)]
+    const ACCESS_DENIED: i32 = libc::EACCES;
+
+    #[cfg(windows)]
+    const ACCESS_DENIED: i32 = windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED.cast_signed();
+
+    /// How many times `access` walks the root for an operation that always
+    /// fails with `error`.
+    fn walks(error: impl Fn() -> std::io::Error) -> usize {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        let root = Root::new(&base).unwrap();
+        let result = root.access(&base.join("file"), |_| Err::<(), _>(error()));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        root.walks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_denial_by_the_filesystem_is_not_retried() {
+        assert_eq!(
+            walks(|| std::io::Error::from_raw_os_error(ACCESS_DENIED)),
+            1
+        );
+    }
+
+    #[test]
+    fn an_escape_refused_by_the_root_is_retried_once() {
+        let escape = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a path led outside of the filesystem",
+            )
+        };
+        assert_eq!(walks(escape), 2);
     }
 
     #[test]

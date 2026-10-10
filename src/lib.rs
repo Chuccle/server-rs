@@ -205,14 +205,13 @@ pub async fn get_file_handler(
     let mut response = match content {
         // Answered entirely from memory: no open, no read, no page-cache round
         // trip, and the body is a slice of a buffer we already hold.
-        utils::cache::Content::Resident(node) => {
+        utils::cache::Served::Resident(node) => {
             utils::http::resident_response(&node, request.method(), request.headers())
         }
 
-        // Open beneath the export root and stream that same handle. Reopening
-        // a cached canonical pathname here would reintroduce traversal races.
-        utils::cache::Content::Streamed => {
-            let file = data.store.open_file(&canonical).await?;
+        // Streams the handle opened beneath the export root. Reopening the
+        // cached canonical pathname here would reintroduce traversal races.
+        utils::cache::Served::Streamed(file) => {
             utils::http::streamed_response(file, &canonical, request.method(), request.headers())
                 .await?
         }
@@ -3177,7 +3176,7 @@ mod tests {
             let root = primed(&state, "").await;
 
             let (target, content, _, _) = state.store.file_content("test_file.txt").await.unwrap();
-            assert!(matches!(content, utils::cache::Content::Resident(_)));
+            assert!(matches!(content, utils::cache::Served::Resident(_)));
             assert!(state.store.has_content(&target));
 
             let events = [event(
