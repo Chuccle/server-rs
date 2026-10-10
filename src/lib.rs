@@ -2906,6 +2906,84 @@ mod tests {
             assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
         }
 
+        async fn statuses(state: Arc<AppState>, path: &str) -> [http::StatusCode; 3] {
+            let app = build_router(state);
+            let mut statuses = [http::StatusCode::OK; 3];
+            let endpoints = ["get_dir_entry_info", "get_dir_info", "get_file"];
+            for (status, endpoint) in statuses.iter_mut().zip(endpoints) {
+                *status = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/{endpoint}?path={path}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status();
+            }
+            statuses
+        }
+
+        /// A name no file could have is the client's mistake, not the
+        /// server failing.
+        #[tokio::test]
+        async fn a_name_too_long_for_any_file_is_a_bad_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            let name = "a".repeat(300);
+            for path in [name.clone(), format!("test_dir/{name}")] {
+                assert_eq!(
+                    statuses(Arc::clone(&state), &path).await,
+                    [http::StatusCode::BAD_REQUEST; 3],
+                    "{path}"
+                );
+            }
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn a_name_holding_a_character_windows_forbids_is_a_bad_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            for path in [
+                "a%3Cb",
+                "a%3Eb",
+                "a%7Cb",
+                "a%22b",
+                "a%2Ab",
+                "a%3Fb",
+                "test_dir/a%3Cb",
+            ] {
+                assert_eq!(
+                    statuses(Arc::clone(&state), path).await,
+                    [http::StatusCode::BAD_REQUEST; 3],
+                    "{path}"
+                );
+            }
+        }
+
+        /// A symlink loop resolves to nothing.
+        #[tokio::test]
+        async fn a_symlink_loop_is_not_found() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = setup_test_env(temp.path());
+            for (link, target) in [("one", "two"), ("two", "one")] {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, temp.path().join(link)).unwrap();
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_dir(target, temp.path().join(link)).unwrap();
+            }
+            for path in ["one", "one/file.txt"] {
+                assert_eq!(
+                    statuses(Arc::clone(&state), path).await,
+                    [http::StatusCode::NOT_FOUND; 3],
+                    "{path}"
+                );
+            }
+        }
+
         #[tokio::test]
         #[cfg(unix)]
         async fn test_permission_denied() {
