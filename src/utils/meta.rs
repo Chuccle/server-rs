@@ -28,17 +28,6 @@ impl RawMeta {
             is_dir: metadata.is_dir(),
         }
     }
-
-    #[inline]
-    pub fn from_std(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            size: metadata.len(),
-            created: file_time(metadata.created()),
-            modified: file_time(metadata.modified()),
-            accessed: file_time(metadata.accessed()),
-            is_dir: metadata.is_dir(),
-        }
-    }
 }
 
 /// Platforms that cannot report a timestamp (`created` on most Linux
