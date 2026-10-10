@@ -384,13 +384,7 @@ impl DirNode {
 /// that serving it is a handful of `HeaderValue` refcount bumps.
 pub struct FileNode {
     pub data: Bytes,
-    pub len: u64,
-    /// Truncated to whole seconds so it compares cleanly against an
-    /// `If-Modified-Since`, which only has second granularity.
-    pub modified: Option<std::time::SystemTime>,
-    pub content_type: axum::http::HeaderValue,
-    pub last_modified: Option<axum::http::HeaderValue>,
-    pub etag: Option<axum::http::HeaderValue>,
+    pub representation: crate::utils::http::Representation,
 }
 
 /// A cached value and the feed generation its load began at.
@@ -1062,48 +1056,11 @@ fn load_content(root: &path::Root, path: &Path, limit: u64) -> Result<Content, A
 
     // Trust what was actually read over what the metadata claimed.
     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-    let modified = metadata.modified().ok().map(truncate_to_seconds);
-
-    let content_type = axum::http::HeaderValue::from_str(
-        mime_guess::from_path(path).first_or_octet_stream().as_ref(),
-    )
-    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
-
-    let last_modified = modified
-        .map(httpdate::fmt_http_date)
-        .and_then(|date| axum::http::HeaderValue::from_str(&date).ok());
-
-    // Strong validator over the two things that change when the bytes do,
-    // spelled the way the streaming file service spells its own, so a file
-    // carries one tag whichever way it is served and a client can check a
-    // range against the size and time a listing gave it. tower-http documents
-    // its spelling as an implementation detail, so
-    // `a_file_carries_one_entity_tag_resident_or_streamed` pins it, and the
-    // driver's `HttpParseFileVersion` parses it.
-    let etag = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|since| {
-            let (seconds, nanos) = (since.as_secs(), since.subsec_nanos());
-            axum::http::HeaderValue::from_str(&format!("\"{seconds:x}.{nanos:08x}-{len:x}\"")).ok()
-        });
 
     Ok(Content::Resident(Arc::new(FileNode {
         data: Bytes::from(data),
-        len,
-        modified,
-        content_type,
-        last_modified,
-        etag,
+        representation: crate::utils::http::Representation::of(path, &metadata, len),
     })))
-}
-
-fn truncate_to_seconds(time: std::time::SystemTime) -> std::time::SystemTime {
-    time.duration_since(std::time::UNIX_EPOCH)
-        .map_or(time, |since| {
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(since.as_secs())
-        })
 }
 
 /// Translate a debounced batch of filesystem events into cache invalidations,
