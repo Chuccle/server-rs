@@ -237,25 +237,20 @@ fn list_children(directory: &cap_std::fs::Dir) -> std::io::Result<Vec<(Box<str>,
 }
 
 impl DirNode {
-    /// Read a directory and encode everything the hot path will ever need.
+    /// Read an opened directory and encode everything the hot path will ever
+    /// need. Taking the directory opened, rather than a path, leaves where it
+    /// may be opened from to the caller: the store opens beneath its export
+    /// root. Child metadata does not follow symlinks, as with std's
+    /// `DirEntry`.
     ///
-    /// Blocking: one `metadata` call plus one `read_dir` walk. The sort and the
-    /// listing encode happen here so that no request ever pays for them.
+    /// Blocking: one `metadata` call plus one walk of the entries. The sort and
+    /// the listing encode happen here so that no request ever pays for them.
     ///
     /// # Errors
     ///
-    /// [`AppError::NotFound`] if `path` is not a directory, plus the usual I/O
-    /// mappings if it cannot be read.
-    pub fn scan(path: &Path) -> Result<Self, AppError> {
-        Self::scan_opened(&cap_std::fs::Dir::open_ambient_dir(
-            path,
-            cap_std::ambient_authority(),
-        )?)
-    }
-
-    /// Store loaders supply a directory opened beneath their export root.
-    /// Child metadata remains non-following, as with std's `DirEntry`.
-    fn scan_opened(directory: &cap_std::fs::Dir) -> Result<Self, AppError> {
+    /// [`AppError::NotFound`] if `directory` is not a directory, plus the usual
+    /// I/O mappings if it cannot be read.
+    pub fn scan(directory: &cap_std::fs::Dir) -> Result<Self, AppError> {
         let own_metadata = directory.dir_metadata()?;
 
         if !own_metadata.is_dir() {
@@ -892,7 +887,7 @@ impl Store {
                 .dirs
                 .try_get_with(cache_key, async move {
                     let node = tokio::task::spawn_blocking(move || {
-                        DirNode::scan_opened(&root.open_dir(&scan_path)?)
+                        DirNode::scan(&root.open_dir(&scan_path)?)
                     })
                     .await??;
 
@@ -1012,7 +1007,7 @@ impl Store {
     ///
     /// If `canonical` cannot be scanned.
     pub async fn plant_directory(&self, canonical: &Path, generation: u64) {
-        let node = DirNode::scan(canonical).expect("scan");
+        let node = DirNode::scan(&self.root.open_dir(canonical).expect("open")).expect("scan");
         self.dirs
             .insert(canonical.to_path_buf(), Stamped::new(Arc::new(node), generation))
             .await;
@@ -1338,9 +1333,16 @@ mod tests {
             );
             return;
         }
-        let node = DirNode::scan(root.path()).unwrap();
+        let node = scan(root.path()).unwrap();
         assert!(node.child("target").unwrap().is_dir);
         assert!(!node.child("link").unwrap().is_dir);
+    }
+
+    fn scan(path: &Path) -> Result<DirNode, AppError> {
+        DirNode::scan(&cap_std::fs::Dir::open_ambient_dir(
+            path,
+            cap_std::ambient_authority(),
+        )?)
     }
 
     /// Build a directory and scan it, so the index under test is the one the
@@ -1355,7 +1357,7 @@ mod tests {
             std::fs::create_dir(temp.path().join(name)).expect("mkdir");
         }
 
-        let node = DirNode::scan(temp.path()).expect("scan");
+        let node = scan(temp.path()).expect("scan");
         (temp, node)
     }
 
@@ -1420,7 +1422,7 @@ mod tests {
 
         // `DirNode` has no `PartialEq`, so match on the error rather than the
         // whole `Result`.
-        match DirNode::scan(&file) {
+        match scan(&file) {
             Err(error) => assert_eq!(error, AppError::NotFound),
             Ok(_) => panic!("scanning a plain file should not produce a listing"),
         }
