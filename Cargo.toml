@@ -41,7 +41,7 @@ flatbuffers = "25.12.19"
 # out refcounted response bodies and pre-render file headers.
 bytes = "1.11.1"
 httpdate = "1.0.3"
-http-range-header = "0.4.2"
+http-range-header = "1.1.0"
 mime_guess = "2.0.5"
 log = { version = "0.4.29", optional = true }
 thiserror = "2.0.18"
